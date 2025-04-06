@@ -43,3 +43,8 @@ spark = (
 df = spark.sql("SELECT * FROM iceberg_catalog.dq.unpivoted_data LIMIT 30")
 
 df.show()
+
+# NEXT STEPS:
+# USE A PYSPARK SESSION TO READ DATA FROM THE CSV FILE TO AVOID CONSUMING AWS
+# USE THE DATA TO CONCENTRATE ON THE ML MODELS
+
