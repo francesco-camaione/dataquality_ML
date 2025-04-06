@@ -1,0 +1,48 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "glue:CreateDatabase",
+                "glue:DeleteDatabase",
+                "glue:GetDatabase",
+                "glue:GetDatabases",
+                "glue:UpdateDatabase",
+                "glue:CreateTable",
+                "glue:DeleteTable",
+                "glue:GetTable",
+                "glue:GetTables",
+                "glue:UpdateTable",
+                "glue:GetTableVersions",
+                "glue:DeleteTableVersion",
+                "glue:BatchDeleteTableVersion",
+                "glue:BatchGetPartition",
+                "glue:GetPartition",
+                "glue:GetPartitions",
+                "glue:CreatePartition",
+                "glue:DeletePartition",
+                "glue:UpdatePartition"
+            ],
+            "Resource": [
+                "arn:aws:glue:eu-west-1:*:catalog",
+                "arn:aws:glue:eu-west-1:*:database/*",
+                "arn:aws:glue:eu-west-1:*:table/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetBucketLocation",
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dremio-e8965ec1-b30e-44f5-899d-525d895db468",
+                "arn:aws:s3:::dremio-e8965ec1-b30e-44f5-899d-525d895db468/*"
+            ]
+        }
+    ]
+} 
