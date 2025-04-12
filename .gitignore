@@ -1,5 +1,6 @@
 iceberg_catalog/
 app/prova.py
+spark-warehouse/
 
 # Environment variables
 .env
