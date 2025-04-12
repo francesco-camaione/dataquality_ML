@@ -65,5 +65,4 @@ print("Spark is running...")
 
 spark.sql("SELECT * FROM s3tablescatalog.dq_db.unpivoted_datacenter_data.history ORDER BY made_current_at DESC;").show()
 
-
 print("Spark is done!!")
