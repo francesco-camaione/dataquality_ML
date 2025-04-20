@@ -24,14 +24,13 @@ class ColumnClassifier:
         return f"""
             Task: column_type_classification. 
             Guidance:
-            - If the datatype is 'string', classify the column as 'text', 'categorical', or 'boolean' based on its values.
-            - Do not classify 'string' columns as 'numerical' even if the values look numeric — treat them as text unless they clearly represent categories or boolean values.
-            - If the datatype is numerical and the values appear very large (e.g., 10-digit integers), consider whether they might be Unix timestamps. Classify such columns as 'date' or 'datetime' if appropriate.
+            - If the datatype is 'string', classify the column as 'categorical'.
+            - If the datatype is numerical and the values appear very large (e.g., 10-digit integers), consider whether they might be Unix timestamps. Classify such columns as 'date' or 'datetime', 'numeric' otherwise.
             Column Metadata:
             {{
             "column name": "{name}",
             "spark datatype": "{dtype}",
-            "sample of values": [{", ".join(f'"{str(v)}"' for v in values[:10])}]
+            "sample of values": [{", ".join(f'"{str(v)}"' for v in values[:3])}]
             }}
         """
 
