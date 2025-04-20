@@ -1,9 +1,7 @@
 from pyspark.sql import DataFrame
-import aiohttp
-import asyncio
 import os
-import certifi
-import ssl
+import requests
+import json
 
 
 class ColumnClassifier:
@@ -21,6 +19,7 @@ class ColumnClassifier:
         return []
 
     def _build_model_context(self, name, dtype, values):
+        # Build model context for each column to be sent to the model for classification
         return f"""
             Task: column_type_classification. 
             Guidance:
@@ -34,9 +33,7 @@ class ColumnClassifier:
             }}
         """
 
-    async def _classify_with_llm(self, name, dtype, values):
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-
+    def _classify_with_llm(self, name, dtype, values):
         input_text = self._build_model_context(name, dtype, values)
 
         payload = {
@@ -51,25 +48,19 @@ class ColumnClassifier:
             'Content-Type': 'application/json'
         }
 
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as session:
-            try:
-                async with session.post(self.hf_url, json=payload, headers=headers, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("labels", ["unknown"])[0]
-                    else:
-                        error_text = await resp.text()
-                        print(f"[ERROR] Column: '{name}' - Status: {resp.status} - Response: {error_text}")
-                        return "unknown"
+        response = requests.post(self.hf_url, json=payload, headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("labels", ["unknown"])[0]
+        else:
+            print(f"[ERROR] Column: '{name}' - Status: {response.status_code} - Response: {response.text}")
+            return "unknown"
 
-            except Exception as e:
-                print(f"Error with LLM API request for column '{name}': {str(e)}")
-                return "unknown"
-
-    async def classify_columns(self):
-        """Classify all columns in the DataFrame in parallel."""
-        tasks = []
-        metadata = []
+    def classify_columns(self) -> dict:
+        numerical_columns = []
+        categorical_columns = []
+        to_cast = []
 
         for field in self.df.schema.fields:
             name = field.name
@@ -77,25 +68,24 @@ class ColumnClassifier:
             values = self._get_sample_values(name)
 
             if self.llm_enabled and values:
-                tasks.append(self._classify_with_llm(name, dtype, values))
-                metadata.append((name, dtype))
+                classified_type = self._classify_with_llm(name, dtype, values)
             else:
                 # Handle case with no values or LLM disabled
-                metadata.append((name, dtype))
-                tasks.append(asyncio.sleep(0, result="unknown"))  # dummy awaitable
+                classified_type = "unknown"
 
-        classified_types = await asyncio.gather(*tasks)
+            # Classify based on the LLM's response
+            if classified_type == "categorical":
+                categorical_columns.append(name)
+            elif classified_type == "date" or classified_type == "datetime":
+                to_cast.append((name, "datetime" if classified_type == "datetime" else "date"))
+            else:
+                numerical_columns.append(name)
 
-        results = [
-            {
-                "column": name,
-                "spark_type": dtype,
-                "classified_type": classified
-            }
-            for (name, dtype), classified in zip(metadata, classified_types)
-        ]
-
-        return results
+        return {
+            "numerical_columns": numerical_columns,
+            "categorical_columns": categorical_columns,
+            "to_cast": to_cast
+        }
 
 
 if __name__ == "__main__":
@@ -113,7 +103,6 @@ if __name__ == "__main__":
 
     classifier = ColumnClassifier(df, hf_token=hf_token)
 
-    results = asyncio.run(classifier.classify_columns())
+    results = classifier.classify_columns()
 
-    for result in results:
-        print(result)
+    print(json.dumps(results, indent=4))  # Print the results in a formatted JSON
