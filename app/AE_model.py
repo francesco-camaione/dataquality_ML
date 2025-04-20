@@ -14,7 +14,7 @@ from lib.utils import ms_error, plot_reconstruction_error
 spark = SparkSession.builder.appName("DQ App").getOrCreate()
 
 df = spark.read.option("header", "true").csv(
-    "./unpivoted_data_10k/part-00000-5141f42c-90aa-4ee7-9672-5f5198bdc394-c000.csv",
+    "./dataset/unpivoted_data_10k.csv",
     inferSchema=True,
 )
 

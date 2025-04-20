@@ -17,8 +17,8 @@ spark = (
         "org.apache.hadoop:hadoop-aws:3.3.4,"
         "software.amazon.awssdk:url-connection-client:2.20.160",
     )
-    .config("spark.jars.repositories", "https://repo1.maven.org/maven2/,https://repos.spark-packages.org/,https://repo.maven.apache.org/maven2/",)
-    .config("spark.sql.catalog.s3tablescatalog", "org.apache.iceberg.spark.SparkCatalog",)
+    .config("spark.jars.repositories", "https://repo1.maven.org/maven2/,https://repos.spark-packages.org/,https://repo.maven.apache.org/maven2/")
+    .config("spark.sql.catalog.s3tablescatalog", "org.apache.iceberg.spark.SparkCatalog")
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
     .config("spark.sql.catalog.s3tablescatalog.glueRegion", AWS_REGION)
     .config("spark.sql.catalog.s3tablescatalog.glue.catalog-id", GLUE_CATALOG_ID)
