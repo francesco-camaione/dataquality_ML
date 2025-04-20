@@ -19,7 +19,7 @@ df = spark.read.option("header", "true").csv(
     inferSchema=True,
 )
 
-# Define categorical and numerical columns
+# define categorical and numerical columns
 categorical_cols = [
     "location",
     "kind",
@@ -30,20 +30,23 @@ categorical_cols = [
 ]
 numerical_cols = ["interval_start"]
 
-
+# maps strings to numbers
 indexers = [
     StringIndexer(inputCol=c, outputCol=c + "_idx", handleInvalid="skip")
     for c in categorical_cols
 ]
 feature_cols = [c + "_idx" for c in categorical_cols] + numerical_cols
+
+# combines the features values all into a single vector
 assembler = VectorAssembler(inputCols=feature_cols, outputCol="assembled_features")
 
-# Standardize the features
+# standardize the assembled features values so that they have a mean of 0 and a standard deviation of 1
+# to makes the ML model less sensitive to the scale of the features
 scaler = StandardScaler(
     inputCol="assembled_features", outputCol="features", withMean=True, withStd=True
 )
 
-# Build pipeline
+
 pipeline = Pipeline(stages=indexers + [assembler, scaler])
 fitted_pipeline = pipeline.fit(df)
 processed_df = fitted_pipeline.transform(df)
