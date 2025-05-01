@@ -1,4 +1,8 @@
 iceberg_catalog/
+app/prova.py
+spark-warehouse/
+dataset/
+
 # Environment variables
 .env
 .env.*
@@ -39,8 +43,6 @@ env/
 *.swo
 .DS_Store
 
-# Jupyter Notebook
-.ipynb_checkpoints
 
 # Logs
 *.log
