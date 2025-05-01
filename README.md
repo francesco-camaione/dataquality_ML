@@ -8,8 +8,8 @@ This project implements Autoencoder (AE) models using PySpark and Keras for anom
 ## Installation
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
-   cd <repository-directory>
+   git clone https://github.com/francesco-camaione/dataquality_ML.git
+   cd dataquality_ML
    ```
 
 2. Install the required packages:
