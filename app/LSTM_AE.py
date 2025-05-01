@@ -7,28 +7,21 @@ import numpy as np
 from pyspark.sql import SparkSession
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler
-from keras.models import Model
+from keras.models import Model, load_model
 from keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
-from keras.optimizers import Adam
-from lib.utils import create_sequences, ms_error, plot_reconstruction_error
+from keras.optimizers.legacy import Adam
+from lib.utils import create_sequences, ms_error, plot_reconstruction_error, infer_column_types_from_schema
 
-spark = SparkSession.builder.appName("DQ App").getOrCreate()
+table_name = "fraud_detection"
+spark = SparkSession.builder.appName("App")\
+    .config("spark.driver.bindAddress", "127.0.0.1")\
+    .config("spark.executor.memory", "5g") \
+    .getOrCreate()
 
 df = spark.read.option("header", "true").csv(
-    "./unpivoted_data_10k/part-00000-5141f42c-90aa-4ee7-9672-5f5198bdc394-c000.csv",
-    inferSchema=True,
-)
-
-# define categorical and numerical columns
-categorical_cols = [
-    "location",
-    "kind",
-    "host",
-    "method",
-    "statusCode",
-    "endpoint",
-]
-numerical_cols = ["interval_start"]
+        f"./dataset/{table_name}.csv", inferSchema=True,
+    ).limit(10000)
+categorical_cols, numerical_cols = infer_column_types_from_schema(df.schema)
 
 # maps strings to numbers
 indexers = [
@@ -46,18 +39,19 @@ scaler = StandardScaler(
     inputCol="assembled_features", outputCol="features", withMean=True, withStd=True
 )
 
-
 pipeline = Pipeline(stages=indexers + [assembler, scaler])
 fitted_pipeline = pipeline.fit(df)
 processed_df = fitted_pipeline.transform(df)
 
 pdf = processed_df.select("features").toPandas()
 
+# convert features to numpy array and finally the whole to a python array
 feature_list = pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
+# all values are stored using 32-bit floats
 data = np.array(feature_list, dtype=np.float32)  
 
 # Ensure the data is reshaped correctly for LSTM
-timesteps = 15
+timesteps = 20
 X = create_sequences(data, timesteps)
 
 print(f"Data shape: {data.shape}")
@@ -99,7 +93,6 @@ n_features = X_train.shape[2]
 #     shuffle=True
 # )
 
-
 # X_test_pred = lstm_ae.predict(X_test)
 
 # reconstruction_errors =  ms_error(X_test, X_test_pred)
@@ -110,14 +103,25 @@ n_features = X_train.shape[2]
 
 # anomalies = reconstruction_errors > threshold
 
-# lstm_ae.save("./ml_models/LSTM_AE.keras")
+#lstm_ae.save(f"./ml_models/LSTM_AE_{table_name}.keras")
+loaded_model = load_model(f"./ml_models/LSTM_AE_{table_name}.keras")
+X_test_pred = loaded_model.predict(X_test)
+reconstruction_errors = ms_error(X_test, X_test_pred)
+threshold = np.percentile(reconstruction_errors, 95)
+anomalies = reconstruction_errors > threshold
 
 
-#print(f"Detected {np.sum(anomalies)} anomalies in the test set out of {len(X_test)} sequences.")
-plot_reconstruction_error(
-    model_path="./ml_models/LSTM_AE.keras", test_data=X_test, percentile=95
-)
-# print details of the detected anomalies
-# for i, error in enumerate(reconstruction_errors):
-#     if anomalies[i]:
-#         print(f"Sequence {i} reconstruction error: {error:.4f} (Anomaly)")
+# print(f"Detected {np.sum(anomalies)} anomalies in the test set out of {len(X_test)} sequences.")
+# plot_reconstruction_error(
+#     model_path=f"./ml_models/LSTM_AE_{table_name}.keras", test_data=X_test, percentile=95
+# )
+# Assuming 'pdf' is the DataFrame containing the original data
+print("Details of the detected anomalies")
+print("anomalies: ", anomalies)
+
+for i in range(anomalies.shape[0]):  # Loop over each sequence
+    if np.any(anomalies[i]):  # Check if any feature in the current sequence is an anomaly
+        error = reconstruction_errors[i]  # Get the corresponding reconstruction error
+        print(f"Anomaly detected at sequence index {i} with reconstruction error: {error:.4f}")
+        # Print the corresponding original data record
+        print("Original data record:", pdf.iloc[train_size + i].to_dict())  # Adjust index for test set # Adjust index for test set# Adjust index for test set

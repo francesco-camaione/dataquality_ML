@@ -18,20 +18,47 @@ class ColumnClassifier:
             return [row[col_name] for row in self.df.select(col_name).limit(self.sample_size).collect()]
         return []
 
-    def _build_model_context(self, name, dtype, values):
-        # Build model context for each column to be sent to the model for classification
-        return f"""
-            Task: column_type_classification. 
-            Guidance:
-            - If the datatype is 'string', classify the column as 'categorical'.
-            - If the datatype is numerical and the values appear very large (e.g., 10-digit integers), consider whether they might be Unix timestamps. Classify such columns as 'date' or 'datetime', 'numeric' otherwise.
-            Column Metadata:
-            {{
-            "column name": "{name}",
-            "spark datatype": "{dtype}",
-            "sample of values": [{", ".join(f'"{str(v)}"' for v in values[:3])}]
-            }}
+    def _is_unix_timestamp(self, values):
         """
+        Check if values in the numerical column resemble Unix timestamps.
+        A Unix timestamp typically has 10 digits and represents seconds since 1970-01-01.
+        """
+        for value in values:
+            if isinstance(value, int) and len(str(value)) == 10:
+                return True
+        return False
+
+    def _classify_numerical_column(self, name, dtype, values):
+        """
+        Classify the numerical column by checking if it should be treated as a Unix timestamp.
+        """
+        if self._is_unix_timestamp(values):
+            return "datetime"
+        else:
+            return "numerical"
+
+    def classify_numerical_columns(self) -> dict:
+        to_cast = []
+
+        for field in self.df.schema.fields:
+            name = field.name
+            dtype = field.dataType.simpleString()
+
+            if dtype in ['int', 'long', 'float', 'double']:  # Only handle numerical columns
+                values = self._get_sample_values(name)
+
+                # If there are values and LLM is enabled, classify with the LLM, else check for Unix timestamp
+                if self.llm_enabled and values:
+                    classified_type = self._classify_with_llm(name, dtype, values)
+                else:
+                    classified_type = self._classify_numerical_column(name, dtype, values)
+
+                # Classify based on the determined type
+                if classified_type == "datetime":
+                    to_cast.append((name, "datetime"))
+                # Else leave as numerical column (no action needed)
+
+        return {"to_cast": to_cast}
 
     def _classify_with_llm(self, name, dtype, values):
         input_text = self._build_model_context(name, dtype, values)
@@ -39,7 +66,7 @@ class ColumnClassifier:
         payload = {
             "inputs": input_text,
             "parameters": {
-                "candidate_labels": ["categorical", "numerical", "date", "datetime", "unknown"]
+                "candidate_labels": ["date", "datetime"]
             }
         }
 
@@ -57,41 +84,33 @@ class ColumnClassifier:
             print(f"[ERROR] Column: '{name}' - Status: {response.status_code} - Response: {response.text}")
             return "unknown"
 
-    def classify_columns(self) -> dict:
-        numerical_columns = []
-        categorical_columns = []
-        to_cast = []
+    def _build_model_context(self, name, dtype, values):
+        return f"""
+            Task: Determine the semantic type of a data column.
 
-        for field in self.df.schema.fields:
-            name = field.name
-            dtype = field.dataType.simpleString()
-            values = self._get_sample_values(name)
+            Instructions:
+            - If the datatype is 'string', classify as 'categorical'.
+            - If the datatype is 'numerical':
+                - Check if values resemble Unix timestamps (i.e., 10-digit integers that represent seconds since Jan 1, 1970). If so, classify as 'datetime'.
+                - Otherwise, classify as 'numerical'.
 
-            if self.llm_enabled and values:
-                classified_type = self._classify_with_llm(name, dtype, values)
-            else:
-                # Handle case with no values or LLM disabled
-                classified_type = "unknown"
-
-            # Classify based on the LLM's response
-            if classified_type == "categorical":
-                categorical_columns.append(name)
-            elif classified_type == "date" or classified_type == "datetime":
-                to_cast.append((name, "datetime" if classified_type == "datetime" else "date"))
-            else:
-                numerical_columns.append(name)
-
-        return {
-            "numerical_columns": numerical_columns,
-            "categorical_columns": categorical_columns,
-            "to_cast": to_cast
-        }
-
+            Column:
+            {{
+                "name": "{name}",
+                "type": "{dtype}",
+                "sample_values": [{", ".join(f'"{str(v)}"' for v in values[:3])}]
+            }}
+        """
 
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
     from dotenv import load_dotenv
-
+    import sys
+    import os
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.append(project_root)
+    from lib import utils
+    
     load_dotenv()
     hf_token = os.getenv("HUGGING_FACE_TOKEN")
 
@@ -100,9 +119,10 @@ if __name__ == "__main__":
         "./dataset/unpivoted_data_10k.csv",
         inferSchema=True,
     ).limit(20)
+    _, numerical_cols = utils.infer_column_types_from_schema(df.schema)
 
-    classifier = ColumnClassifier(df, hf_token=hf_token)
+    classifier = ColumnClassifier(df[numerical_cols], hf_token=hf_token)
 
-    results = classifier.classify_columns()
+    results = classifier.classify_numerical_columns()
 
-    print(json.dumps(results, indent=4))  # Print the results in a formatted JSON
+    print(json.dumps(results, indent=4))  # Output only numerical columns that need casting to datetime
