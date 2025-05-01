@@ -1,5 +1,6 @@
 import sys
 import os
+
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
 from pyspark.sql import SparkSession
@@ -8,7 +9,11 @@ from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler
 import keras
 import numpy as np
 from sklearn.model_selection import train_test_split
-from lib.utils import ms_error, plot_reconstruction_error
+from lib.utils import (
+    ms_error,
+    plot_reconstruction_error,
+    infer_column_types_from_schema,
+)
 
 
 spark = SparkSession.builder.appName("DQ App").getOrCreate()
@@ -18,17 +23,7 @@ df = spark.read.option("header", "true").csv(
     inferSchema=True,
 )
 
-# Define categorical and numerical columns
-categorical_cols = [
-    "location",
-    "kind",
-    "host",
-    "method",
-    "statusCode",
-    "endpoint",
-]
-numerical_cols = ["interval_start"]
-
+categorical_cols, numerical_cols = infer_column_types_from_schema(df.schema)
 
 # Create StringIndexers for categorical columns
 indexers = [
@@ -50,7 +45,7 @@ fitted_pipeline = pipeline.fit(df)
 processed_df = fitted_pipeline.transform(df)
 
 pipeline_path = "./pipelines/AE_pipeline"
-fitted_pipeline.write().overwrite().save(pipeline_path)
+# fitted_pipeline.write().overwrite().save(pipeline_path)
 
 
 features_df = processed_df.select("features").toPandas()

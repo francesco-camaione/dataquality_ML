@@ -1,6 +1,7 @@
 iceberg_catalog/
 app/prova.py
 spark-warehouse/
+dataset/
 
 # Environment variables
 .env
