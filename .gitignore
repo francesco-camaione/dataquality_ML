@@ -2,7 +2,7 @@ iceberg_catalog/
 app/prova.py
 spark-warehouse/
 dataset/
-
+TODO.txt
 # Environment variables
 .env
 .env.*
