@@ -10,6 +10,7 @@ GLUE_CATALOG_ID = os.environ.get("GLUE_CATALOG_ID")
 
 spark = (
     SparkSession.builder.appName("DQ App")
+    .config("spark.driver.host", "127.0.0.1")
     .config(
         "spark.jars.packages",
         "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.8.1,"
@@ -44,6 +45,6 @@ print("Spark is running...")
 #     FROM parquet.`s3a://dq-monitoring-bucket/raw_data/unpivoted_data.parquet`;
 # """).show()
 
-spark.sql("SELECT COUNT(*) AS tot FROM s3tablescatalog.dq_db.unpivoted_datacenter_data;").show()
+spark.sql("SELECT * FROM s3tablescatalog.dq_db.unpivoted_datacenter_data limit 10;").show()
 
 print("Spark is done!!")
