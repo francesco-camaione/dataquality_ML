@@ -1,773 +1,570 @@
 import sys
 import os
 
+# --- Force TensorFlow to use CPU ---
+import tensorflow as tf
+
+tf.config.set_visible_devices([], "GPU")
+# ---
+
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
-print(f"Project root added to path: {project_root}")
 
-import tensorflow as tf
-import matplotlib.pyplot as plt
-import pandas as pd
 import numpy as np
-import gc
-from pyspark.sql.functions import (
-    col,
-    monotonically_increasing_id,
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
+from keras.models import Model, load_model
+from keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
+from keras.optimizers.legacy import Adam
+from lib.utils import (
+    create_sequences,
+    ms_error,
+    plot_reconstruction_error,
+    infer_column_types_from_schema,
 )
-from pyspark.sql.types import StructType
-
-# --- Scikit-learn Imports ---
-from sklearn.metrics import (
-    confusion_matrix,
-    roc_curve,
-    auc,
-)
-
-from app.utils.tf_utils import (
-    configure_tensorflow,
-    create_sequences_tf,
-    calculate_percentile,
-)
-from app.utils.spark_utils import (
-    create_spark_session,
-)
-from app.utils.data_utils import preprocess_data, process_batch_to_tensor
-from app.utils.pipeline_utils import create_feature_pipeline
-from app.utils.model_utils import create_model
-
-configure_tensorflow()
+from sklearn.metrics import roc_curve, auc
+import matplotlib.pyplot as plt
+from pyspark.sql.functions import col, count, when, stddev_pop, udf
+from pyspark.sql.types import NumericType, BooleanType, BooleanType as SparkBooleanType
 
 table_name = "2024_12_bb_3d"
+spark = (
+    SparkSession.builder.appName("App")
+    .master("local[*]")
+    .config("spark.executor.memory", "4g")
+    .config("spark.driver.memory", "4g")
+    .getOrCreate()
+)
+
+df = spark.read.option("header", "true").csv(
+    f"./dataset/{table_name}.csv",
+    inferSchema=True,
+)
+print(f"Initial DataFrame row count: {df.count()}")
+
+# --- Start: Drop columns that are entirely NULL ---
+cols_to_drop = []
+for c_name in df.columns:
+    # Count non-null values for the current column
+    non_null_count = df.where(col(c_name).isNotNull()).count()
+    if non_null_count == 0:
+        cols_to_drop.append(c_name)
+        print(f"Column '{c_name}' contains only NULL values and will be dropped.")
+
+if cols_to_drop:
+    df = df.drop(*cols_to_drop)
+    print(f"Dropped columns with all NULLs: {cols_to_drop}")
+# --- End: Drop columns that are entirely NULL ---
+
+original_full_pdf = df.toPandas()
+
+# Assuming 'failure' column exists and is 0 for normal, 1 for failure.
+# It should be identified as a numerical column by infer_column_types_from_schema.
+categorical_cols, numerical_cols = infer_column_types_from_schema(df.schema)
+
+print(f"Original categorical columns: {categorical_cols}")
+print(f"Original numerical columns: {numerical_cols}")
+
+# Ensure 'failure' is not in feature_cols if it's there by mistake
+if "failure" in numerical_cols:
+    numerical_cols.remove("failure")
+    print(
+        f"'failure' column removed from numerical_cols. New numerical_cols: {numerical_cols}"
+    )
+if "failure" in categorical_cols:  # Should not happen if it's 0/1
+    categorical_cols.remove("failure")
+    print(
+        f"Warning: 'failure' column was treated as categorical and removed. New categorical_cols: {categorical_cols}"
+    )
+
+# maps strings to numbers
+indexers = [
+    StringIndexer(inputCol=c, outputCol=c + "_idx", handleInvalid="keep")
+    for c in categorical_cols
+]
+feature_cols = [c + "_idx" for c in categorical_cols] + numerical_cols
+print(f"Final feature_cols for VectorAssembler: {feature_cols}")
+
+if not feature_cols:
+    print("Error: feature_cols is empty. No features to assemble and scale. Exiting.")
+    sys.exit(1)
+
+problematic_numerical_cols = []
+if numerical_cols:  # Only check if there are numerical columns
+    # Get schema once for type lookup
+    df_schema = df.schema
+    for nc in numerical_cols:
+        # Get the actual data type of the column
+        field = df_schema[nc]
+        data_type = field.dataType
+
+        null_count_stats = df.select(
+            count(when(col(nc).isNull(), nc)).alias("null_count")
+        ).first()
+        # Efficiently get total_rows once if not already available and df is large
+        # For this loop, df.count() inside is acceptable for clarity, but for very large dfs consider getting it once outside
+        current_total_rows = df.count()
+        is_all_null = null_count_stats["null_count"] == current_total_rows
+
+        if is_all_null:
+            print(f"Warning: Column '{nc}' (type: {data_type}) is ALL NULL.")
+            problematic_numerical_cols.append(nc)
+        elif isinstance(data_type, NumericType):
+            stddev_stats = df.select(stddev_pop(nc).alias("stddev")).first()
+            current_stddev = stddev_stats["stddev"]
+            has_zero_stddev = current_stddev is not None and current_stddev == 0.0
+            is_stddev_null = current_stddev is None
+
+            if has_zero_stddev:
+                print(
+                    f"Warning: Numerical column '{nc}' has zero standard deviation (all values are the same)."
+                )
+                problematic_numerical_cols.append(nc)
+            elif is_stddev_null:
+                distinct_count = df.select(nc).distinct().count()
+                if distinct_count == 1:
+                    print(
+                        f"Warning: Numerical column '{nc}' has only one distinct value (implies zero standard deviation)."
+                    )
+                    problematic_numerical_cols.append(nc)
+                else:
+                    print(
+                        f"Warning: Numerical column '{nc}' has NULL standard deviation but is not all null and has {distinct_count} distinct values. Check data."
+                    )
+                    problematic_numerical_cols.append(nc)
+        elif isinstance(data_type, BooleanType):
+            distinct_non_null_count = df.select(nc).na.drop().distinct().count()
+            if (
+                distinct_non_null_count <= 1
+            ):  # if 0 (all nulls, caught above) or 1 distinct non-null
+                print(
+                    f"Warning: Boolean column '{nc}' has only one distinct non-null value or is all null (implies zero variance for scaling)."
+                )
+                problematic_numerical_cols.append(nc)
+
+if problematic_numerical_cols:
+    print(
+        f"\nFound problematic numerical/boolean columns: {problematic_numerical_cols}"
+    )
+    print(f"Removing them: {problematic_numerical_cols}")
+    numerical_cols = [c for c in numerical_cols if c not in problematic_numerical_cols]
+    # Reconstruct feature_cols after modifying numerical_cols
+    feature_cols = [c + "_idx" for c in categorical_cols] + numerical_cols
+    print(f"Adjusted feature_cols after removing problematic columns: {feature_cols}")
+    if not feature_cols:
+        print(
+            "Error: feature_cols became empty after removing problematic columns. Exiting."
+        )
+        sys.exit(1)
+
+
+# --- Start: Impute NaNs in remaining numerical columns ---
+imputer_stages = []
+imputed_numerical_cols_final = numerical_cols  # Start with current numerical_cols
+if numerical_cols:  # Only impute if there are numerical columns
+    print(f"Starting imputation for numerical columns: {numerical_cols}")
+    imputer = Imputer(
+        inputCols=numerical_cols,
+        outputCols=[c + "_imputed" for c in numerical_cols],
+        strategy="median",  # Changed from mean to median for better handling of outliers
+    )
+    imputer_stages.append(imputer)
+    imputed_numerical_cols_final = [c + "_imputed" for c in numerical_cols]
+    print(f"Numerical columns after imputation will be: {imputed_numerical_cols_final}")
+# Update feature_cols to use imputed numerical columns
+feature_cols_for_assembler = [
+    c + "_idx" for c in categorical_cols
+] + imputed_numerical_cols_final
+print(
+    f"Feature columns for VectorAssembler after imputation: {feature_cols_for_assembler}"
+)
+# --- End: Impute NaNs ---
+
+
+# Add data validation after imputation
+def validate_features(vector):
+    if vector is None:
+        return False
+    arr = vector.toArray()
+    return not (np.isnan(arr).any() or np.isinf(arr).any())
+
+
+validate_features_udf = udf(validate_features, BooleanType())
+
+# combines the features values all into a single vector
+assembler = VectorAssembler(
+    inputCols=feature_cols_for_assembler,
+    outputCol="assembled_features",
+    handleInvalid="keep",
+)
+
+scaler = StandardScaler(
+    inputCol="assembled_features", outputCol="features", withMean=True, withStd=True
+)
+
+# Pipeline for feature processing
+pipeline_stages = indexers + imputer_stages + [assembler, scaler]
+feature_pipeline = Pipeline(stages=pipeline_stages)
+
+fitted_feature_pipeline = feature_pipeline.fit(df)
+processed_df_features = fitted_feature_pipeline.transform(df)
+
+# Validate features after processing
+valid_rows = processed_df_features.filter(validate_features_udf(col("features")))
+print(f"Number of valid rows after processing: {valid_rows.count()}")
+print(f"Number of invalid rows: {processed_df_features.count() - valid_rows.count()}")
+
+if valid_rows.count() == 0:
+    print("Error: No valid rows after processing. Check data preprocessing steps.")
+    sys.exit(1)
+
+# Select features and the failure column, then convert to Pandas
+processed_pdf = valid_rows.select("features", "failure").toPandas()
+
+# Separate normal and failure data
+normal_pdf = processed_pdf[processed_pdf["failure"] == 0].copy()
+failure_pdf = processed_pdf[processed_pdf["failure"] == 1].copy()
+
+# Store original indices from failure_pdf which can be used to loc into original_full_pdf
+failure_pdf_original_indices = failure_pdf.index.tolist()
+
+# Prepare normal data features
+normal_feature_list = (
+    normal_pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
+)
+normal_data = np.array(normal_feature_list, dtype=np.float32)
+
+# Prepare failure data features
+failure_feature_list = (
+    failure_pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
+)
+failure_data = np.array(failure_feature_list, dtype=np.float32)
+
+
+# Ensure the data is reshaped correctly for LSTM
 timesteps = 20
-file_path = f"./dataset/{table_name}.csv"
-spark_config = {
-    "spark.driver.memory": "2g",
-    "spark.executor.memory": "2g",
-    "spark.memory.fraction": "0.8",
-    "spark.memory.storageFraction": "0.3",
-    "spark.sql.shuffle.partitions": "50",
-    "spark.default.parallelism": "50",
-    "spark.local.dir": "/tmp",
-    "spark.sql.adaptive.enabled": "true",
-    "spark.sql.adaptive.coalescePartitions.enabled": "true",
-    "spark.sql.adaptive.skewJoin.enabled": "true",
-    "spark.memory.offHeap.enabled": "true",
-    "spark.memory.offHeap.size": "1g",
-    "spark.cleaner.periodicGC.interval": "10min",
-    "spark.cleaner.referenceTracking.blocking": "true",
-    "spark.cleaner.referenceTracking.cleanCheckpoints": "true",
-    "spark.driver.maxResultSize": "1g",
-    "spark.sql.broadcastTimeout": "300",
-    "spark.network.timeout": "300s",
-}
-output_dir = "./dataset/anomalies"
-os.makedirs(output_dir, exist_ok=True)
-plot_dir = "plots"
-os.makedirs(plot_dir, exist_ok=True)
 
-# --- Spark Session ---
-# Moved to create_spark_session in spark_utils.py
-spark = create_spark_session(spark_config)
+# Create sequences for normal data
+X_normal_sequences = create_sequences(normal_data, timesteps)
+# Keep track of original indices for normal data for later reference if needed for false positives
+original_indices_normal = normal_pdf.index[
+    timesteps - 1 : len(normal_pdf) - timesteps + 1 + timesteps - 1
+]
 
 
-# --- Data Loading & Initial Processing ---
-def load_data(spark_session, file_path):
-    """Loads data from CSV and adds a record ID."""
-    print(f"Loading data from: {file_path}")
-    df = spark_session.read.option("header", "true").csv(file_path, inferSchema=True)
-    df = df.withColumn("record_id", monotonically_increasing_id())
-    print("Data loaded.")
-    df.printSchema()
-    return df
+# Create sequences for failure data
+X_failure_sequences = create_sequences(failure_data, timesteps)
+# Map sequence index back to the original index in failure_pdf, then to original_full_pdf
+# These are indices within the `failure_pdf` dataframe.
+corresponding_failure_pdf_indices = []
+if len(X_failure_sequences) > 0:
+    for i in range(len(failure_data) - timesteps + 1):
+        corresponding_failure_pdf_indices.append(
+            failure_pdf_original_indices[i]
+        )  # Storing the original index from failure_pdf
 
 
-# --- Data Preparation Workflow Function ---
-def prepare_sequences_for_model(
-    normal_records_df,
-    fraud_records_df,
-    fitted_pipeline_model,
-    timesteps_val,
-):
-    """Processes data, creates sequences, and splits into train/val/test sets."""
-    print("--- Starting Data Preparation ---")
-    print("Processing normal data batch...")
-    normal_data_tensor, normal_record_ids = process_batch_to_tensor(
-        normal_records_df, fitted_pipeline_model
-    )
-    if normal_data_tensor is None:
-        raise ValueError("Failed to process normal data into tensor")
-    print(f"Normal data tensor shape: {normal_data_tensor.shape}")
+print(f"Normal data shape: {normal_data.shape}")
+print(
+    f"Normal sequence shape: {X_normal_sequences.shape if X_normal_sequences.ndim > 1 else (0,)}"
+)
+print(f"Failure data shape: {failure_data.shape}")
+print(
+    f"Failure sequence shape: {X_failure_sequences.shape if X_failure_sequences.ndim > 1 else (0,)}"
+)
 
-    print("Processing fraud data batch...")
-    fraud_data_tensor, fraud_record_ids = process_batch_to_tensor(
-        fraud_records_df, fitted_pipeline_model
-    )
-    # Handle case where fraud data processing might return None or empty tensor
-    if fraud_data_tensor is None:
-        # Attempt to get n_features from normal data tensor
-        if normal_data_tensor is not None and len(normal_data_tensor.shape) > 1:
-            n_features = normal_data_tensor.shape[1]
-            print("Warning: No fraud data processed. Creating empty fraud tensor.")
-            fraud_data_tensor = tf.zeros((0, n_features), dtype=tf.float32)
-            fraud_record_ids = []
-        else:
-            raise ValueError(
-                "Failed to process fraud data and could not determine feature count from normal data."
-            )
-    elif tf.shape(fraud_data_tensor)[0] == 0:
-        print("Warning: Fraud data processed into an empty tensor.")
-        fraud_record_ids = []  # Ensure IDs are empty if tensor is empty
 
-    print(f"Fraud data tensor shape: {fraud_data_tensor.shape}")
-
-    # Ensure normal_data_tensor is not empty before accessing shape
-    if tf.shape(normal_data_tensor)[0] == 0:
-        raise ValueError(
-            "Normal data tensor is empty, cannot proceed with sequence creation or training."
+# Split normal sequences into training and testing sets (e.g., 80% training for normal data)
+if X_normal_sequences.ndim > 1 and X_normal_sequences.shape[0] > 0:
+    train_size_normal = int(0.8 * len(X_normal_sequences))
+    X_train = X_normal_sequences[:train_size_normal]
+    X_test_normal = X_normal_sequences[train_size_normal:]
+    y_test_normal_labels = np.zeros(len(X_test_normal))
+else:  # Handle case with insufficient normal data
+    X_train = np.empty(
+        (
+            0,
+            timesteps,
+            (
+                normal_data.shape[1]
+                if normal_data.ndim > 1 and normal_data.shape[1] > 0
+                else 0
+            ),
         )
-
-    n_features = normal_data_tensor.shape[1]
-    print(f"Number of features: {n_features}")
-
-    print("Creating sequences for normal data...")
-    X_normal_sequences = create_sequences_tf(normal_data_tensor, timesteps_val)
-    print(f"Normal sequences shape: {X_normal_sequences.shape}")
-
-    # --- Train/Val/Test Split (Normal Data) ---
-    num_normal_sequences = tf.shape(X_normal_sequences)[0]
-    if num_normal_sequences == 0:
-        raise ValueError("No normal sequences created, cannot split data.")
-
-    train_fraction = 0.8
-    val_fraction = 0.1  # Validation fraction of the *total* normal sequences
-    # Test fraction is implicit: 1.0 - train_fraction - val_fraction
-
-    train_size = tf.cast(
-        tf.cast(num_normal_sequences, tf.float32) * train_fraction, tf.int32
     )
-    val_size = tf.cast(
-        tf.cast(num_normal_sequences, tf.float32) * val_fraction, tf.int32
-    )
-
-    # Ensure val_size is at least 1 if possible, and adjust train_size if needed
-    val_size = tf.maximum(
-        val_size,
+    X_test_normal = np.empty(
         (
-            tf.constant(1, dtype=tf.int32)
-            if num_normal_sequences > train_size
-            else tf.constant(0, dtype=tf.int32)
-        ),
+            0,
+            timesteps,
+            (
+                normal_data.shape[1]
+                if normal_data.ndim > 1 and normal_data.shape[1] > 0
+                else 0
+            ),
+        )
     )
-    # Ensure train_size doesn't overlap with val_size due to rounding/minimums
-    train_size = tf.minimum(train_size, num_normal_sequences - val_size)
+    y_test_normal_labels = np.array([])
 
-    # Ensure train_size is at least 1 if possible
-    train_size = tf.maximum(
-        train_size,
-        (
-            tf.constant(1, dtype=tf.int32)
-            if num_normal_sequences > val_size
-            else tf.constant(0, dtype=tf.int32)
-        ),
+# Test set for failures
+X_test_failure = X_failure_sequences
+y_test_failure_labels = np.ones(len(X_test_failure))
+
+print(f"X_train shape: {X_train.shape}")
+print(f"X_test_normal shape: {X_test_normal.shape}")
+print(f"X_test_failure shape: {X_test_failure.shape}")
+
+if X_train.shape[0] == 0 or X_train.shape[2] == 0:
+    print("Not enough data to train the model. Exiting.")
+    sys.exit()
+
+n_features = X_train.shape[2]
+model_dir = "./ml_models"
+os.makedirs(model_dir, exist_ok=True)
+model_path = os.path.join(model_dir, f"LSTM_AE_{table_name}.keras")
+
+lstm_ae = None
+if os.path.exists(model_path):
+    print(f"Loading existing model from {model_path}")
+    try:
+        # Load model with custom_objects to handle optimizer
+        lstm_ae = load_model(model_path, compile=False)
+        # Re-compile the model with the same optimizer settings
+        optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
+        lstm_ae.compile(optimizer=optimizer, loss="mse")
+        print("Model loaded and compiled successfully.")
+        lstm_ae.summary()
+    except Exception as e:
+        print(f"Error loading or compiling model: {e}. Will retrain.")
+        lstm_ae = None
+
+if lstm_ae is None:
+    print("Defining and training a new model...")
+
+    input_seq = Input(shape=(timesteps, n_features))
+    encoded = LSTM(32, activation="relu", return_sequences=True)(input_seq)
+    encoded = LSTM(16, activation="relu")(encoded)
+    decoded = RepeatVector(timesteps)(encoded)
+    decoded = LSTM(16, activation="relu", return_sequences=True)(decoded)
+    decoded = LSTM(32, activation="relu", return_sequences=True)(decoded)
+    decoded = TimeDistributed(Dense(n_features))(decoded)
+    lstm_ae = Model(inputs=input_seq, outputs=decoded)
+
+    # Compile with more robust optimizer settings
+    optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
+    lstm_ae.compile(optimizer=optimizer, loss="mse")
+    lstm_ae.summary()
+
+    # Check for NaNs/Infs in X_train before fitting
+    if np.any(np.isnan(X_train)) or np.any(np.isinf(X_train)):
+        print(
+            "\nERROR: X_train contains NaNs or Infs before model training! Cannot proceed."
+        )
+        print(f"Number of NaNs in X_train: {np.sum(np.isnan(X_train))}")
+        print(f"Number of Infs in X_train: {np.sum(np.isinf(X_train))}")
+        sys.exit(1)
+
+    print("\nNo NaNs or Infs found in X_train. Proceeding with training.")
+    print(
+        f"Input to lstm_ae.fit - X_train shape: {X_train.shape}, y_train shape: {X_train.shape}"
     )
-    # Recalculate val_size in case train_size adjustment affected the boundary
-    val_size = tf.minimum(val_size, num_normal_sequences - train_size)
 
-    test_start_index = train_size + val_size
+    # Add early stopping and model checkpointing
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=3, restore_best_weights=True
+    )
 
-    X_train = X_normal_sequences[:train_size]
-    X_val = X_normal_sequences[train_size:test_start_index]
-    X_test_normal = X_normal_sequences[test_start_index:]
+    model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        model_path, monitor="val_loss", save_best_only=True, save_format="keras"
+    )
 
-    print(f"Train sequences split: {tf.shape(X_train)[0]}")
-    print(f"Validation sequences split: {tf.shape(X_val)[0]}")
-    print(f"Test normal sequences split: {tf.shape(X_test_normal)[0]}")
-
-    # --- Prepare Fraud Test Data ---
-    print("Creating sequences for failure data...")
-    X_test_fraud = tf.zeros(
-        (0, timesteps_val, n_features), dtype=tf.float32
-    )  # Default empty
-
-    if tf.shape(fraud_data_tensor)[0] > 0:
-        num_fraud_samples = tf.shape(fraud_data_tensor)[0]
-        if num_fraud_samples < timesteps_val:
-            print(
-                f"Warning: Padding fraud data ({num_fraud_samples.numpy()} samples) with zeros for sequence creation (timesteps={timesteps_val})."
-            )
-            padding_size = timesteps_val - num_fraud_samples
-            padding = tf.zeros((padding_size, n_features), dtype=tf.float32)
-            fraud_data_tensor_padded = tf.concat([fraud_data_tensor, padding], axis=0)
-            print(f"Padded fraud tensor shape: {fraud_data_tensor_padded.shape}")
-            # Create sequences from padded data - should result in at least one sequence
-            X_test_fraud = create_sequences_tf(fraud_data_tensor_padded, timesteps_val)
-        else:
-            # Enough samples, create sequences directly
-            X_test_fraud = create_sequences_tf(fraud_data_tensor, timesteps_val)
-    else:
-        print("No fraud data samples to create sequences from.")
-
-    print(f"Test fraud sequences shape: {X_test_fraud.shape}")
-    print("--- Data Preparation Finished ---")
-
-    return (
+    history = lstm_ae.fit(
         X_train,
-        X_val,
-        X_test_normal,  # Keep for potential future use, though not used in current evaluation
-        X_test_fraud,
-        normal_record_ids,
-        fraud_record_ids,
-        n_features,
-        normal_data_tensor,  # Pass back the original tensor for threshold calculation
+        X_train,
+        epochs=10,
+        batch_size=32,
+        validation_split=0.2,
+        shuffle=True,
+        callbacks=[early_stopping, model_checkpoint],
     )
+    print(f"New model saved to {model_path}")
 
-
-# --- Model Training Workflow Function ---
-def train_lstm_ae_model(
-    X_train_seq,
-    X_val_seq,
-    n_features_val,
-    timesteps_val,
-    model_name_prefix,  # Use a prefix instead of full table name directly
-    strategy_val,
-    epochs=10,
-    batch_size=32,
-    patience=3,
-):
-    """Creates, trains, and saves the LSTM Autoencoder model within a strategy scope."""
-    print("--- Starting Model Training ---")
-    if tf.shape(X_train_seq)[0] == 0 or tf.shape(X_val_seq)[0] == 0:
-        raise ValueError("Training or validation data is empty. Cannot train model.")
-
-    with strategy_val.scope():
-        model = create_model(n_features_val, timesteps_val)
-
-        train_dataset = (
-            tf.data.Dataset.from_tensor_slices((X_train_seq, X_train_seq))
-            .shuffle(1024)  # Adjust buffer size based on data
-            .batch(batch_size)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-        val_dataset = (
-            tf.data.Dataset.from_tensor_slices((X_val_seq, X_val_seq))
-            .batch(batch_size)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        print(f"Training model for {epochs} epochs with patience {patience}...")
-        checkpoint_path = f"./ml_models/{model_name_prefix}_checkpoint.keras"
-        history = model.fit(
-            train_dataset,
-            epochs=epochs,
-            validation_data=val_dataset,
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="val_loss",
-                    patience=patience,
-                    restore_best_weights=True,
-                    verbose=1,
-                ),
-                tf.keras.callbacks.ModelCheckpoint(
-                    checkpoint_path, save_best_only=True, monitor="val_loss", verbose=1
-                ),
-                tf.keras.callbacks.ReduceLROnPlateau(
-                    monitor="val_loss",
-                    factor=0.5,
-                    patience=patience // 2 + 1,
-                    min_lr=0.00001,
-                    verbose=1,
-                ),
-                # Add TensorBoard callback for visualization
-                # tf.keras.callbacks.TensorBoard(log_dir=f'./logs/{model_name_prefix}', histogram_freq=1)
-            ],
-            verbose=1,  # Or 2 for less output per epoch
-        )
-
-    # Load the best weights saved by ModelCheckpoint
-    print(f"Loading best weights from checkpoint: {checkpoint_path}")
-    try:
-        model.load_weights(checkpoint_path)
-    except Exception as e:
+# Predict on normal test data with error handling
+try:
+    X_test_normal_pred = lstm_ae.predict(X_test_normal, verbose=1)
+    if np.any(np.isnan(X_test_normal_pred)):
+        print("\nWARNING: Predictions on normal test data contain NaNs!")
         print(
-            f"Warning: Could not load weights from checkpoint {checkpoint_path}: {e}. Using weights from end of training."
+            f"Number of NaNs in X_test_normal_pred: {np.sum(np.isnan(X_test_normal_pred))}"
         )
+        # Replace NaNs with zeros or another appropriate value
+        X_test_normal_pred = np.nan_to_num(X_test_normal_pred, nan=0.0)
+    else:
+        print("\nNo NaNs found in X_test_normal_pred.")
+except Exception as e:
+    print(f"Error during prediction on normal test data: {e}")
+    sys.exit(1)
 
-    model_save_path = f"./ml_models/{model_name_prefix}_final.keras"
-    model.save(model_save_path)
-    print(f"Final model saved to {model_save_path}")
-    print("--- Model Training Finished ---")
-    return model, history
-
-
-# --- Prediction and Evaluation Workflow Function ---
-def predict_and_evaluate(model, X_train_seq, X_test_normal, X_test_fr):
-    """
-    Predicts on test data (normal and fraud), calculates errors,
-    and determines the threshold based on training errors.
-    """
-    print("--- Starting Evaluation ---")
-
-    # --- Threshold Calculation (based on training data) ---
-    print("Calculating threshold based on training reconstruction errors...")
-    if tf.shape(X_train_seq)[0] == 0:
-        raise ValueError(
-            "Training data sequences are empty. Cannot calculate threshold."
+# Calculate reconstruction errors with error handling
+try:
+    reconstruction_errors_normal = ms_error(X_test_normal, X_test_normal_pred)
+    if np.any(np.isnan(reconstruction_errors_normal)):
+        print("\nWARNING: Reconstruction errors for normal data contain NaNs!")
+        reconstruction_errors_normal = np.nan_to_num(
+            reconstruction_errors_normal, nan=0.0
         )
+except Exception as e:
+    print(f"Error calculating reconstruction errors for normal data: {e}")
+    sys.exit(1)
+
+# Predict on failure test data with error handling
+if X_test_failure.shape[0] > 0:
+    try:
+        X_test_failure_pred = lstm_ae.predict(X_test_failure, verbose=1)
+        if np.any(np.isnan(X_test_failure_pred)):
+            print("\nWARNING: Predictions on failure test data contain NaNs!")
+            print(
+                f"Number of NaNs in X_test_failure_pred: {np.sum(np.isnan(X_test_failure_pred))}"
+            )
+            X_test_failure_pred = np.nan_to_num(X_test_failure_pred, nan=0.0)
+        else:
+            print("\nNo NaNs found in X_test_failure_pred.")
+    except Exception as e:
+        print(f"Error during prediction on failure test data: {e}")
+        sys.exit(1)
 
     try:
-        train_pred = model.predict(X_train_seq)
-        # Ensure inputs to subtraction are finite
-        X_train_clean = tf.where(tf.math.is_nan(X_train_seq), 0.0, X_train_seq)
-        train_pred_clean = tf.where(tf.math.is_nan(train_pred), 0.0, train_pred)
-
-        normal_train_errors = tf.reduce_mean(
-            tf.square(X_train_clean - train_pred_clean), axis=[1, 2]
-        )
-        # Check if errors calculation resulted in NaNs
-        if tf.reduce_any(tf.math.is_nan(normal_train_errors)):
-            print(
-                "Warning: NaNs found in training reconstruction errors. Threshold calculation might be inaccurate."
+        reconstruction_errors_failure = ms_error(X_test_failure, X_test_failure_pred)
+        if np.any(np.isnan(reconstruction_errors_failure)):
+            print("\nWARNING: Reconstruction errors for failure data contain NaNs!")
+            reconstruction_errors_failure = np.nan_to_num(
+                reconstruction_errors_failure, nan=0.0
             )
-            normal_train_errors = tf.where(
-                tf.math.is_nan(normal_train_errors),
-                tf.zeros_like(normal_train_errors),
-                normal_train_errors,
-            )
-
-        threshold_value_tensor = calculate_percentile(normal_train_errors, 95.0)
-        threshold_value = threshold_value_tensor.numpy()
-        print(
-            f"Classification Threshold (95th percentile of train errors): {threshold_value:.4f}"
-        )
     except Exception as e:
-        print(f"Error calculating threshold: {e}")
-        raise  # Re-raise the exception as threshold is critical
+        print(f"Error calculating reconstruction errors for failure data: {e}")
+        sys.exit(1)
+else:
+    reconstruction_errors_failure = np.array([])
 
-    # --- Prediction on Normal Test Data ---
-    normal_test_errors = tf.constant([], dtype=tf.float32)  # Default empty
-    if tf.shape(X_test_normal)[0] > 0:
-        print(f"Predicting on {tf.shape(X_test_normal)[0]} normal test sequences...")
-        try:
-            X_test_normal_pred = model.predict(X_test_normal)
-            X_test_normal_clean = tf.where(
-                tf.math.is_nan(X_test_normal), 0.0, X_test_normal
-            )
-            X_test_normal_pred_clean = tf.where(
-                tf.math.is_nan(X_test_normal_pred), 0.0, X_test_normal_pred
-            )
-            normal_test_errors = tf.reduce_mean(
-                tf.square(X_test_normal_clean - X_test_normal_pred_clean), axis=[1, 2]
-            )
-            if tf.reduce_any(tf.math.is_nan(normal_test_errors)):
-                print("Warning: NaNs found in normal test reconstruction errors.")
-                normal_test_errors = tf.where(
-                    tf.math.is_nan(normal_test_errors),
-                    tf.zeros_like(normal_test_errors),
-                    normal_test_errors,
-                )
-            print("Prediction on normal test data complete.")
-        except Exception as e:
-            print(f"Error predicting on normal test data: {e}")
-            # Return empty tensor if prediction fails
-            normal_test_errors = tf.constant([], dtype=tf.float32)
-    else:
-        print("No normal test sequences to predict on.")
+# Combine reconstruction errors and true labels for ROC curve
+all_reconstruction_errors = np.concatenate(
+    [reconstruction_errors_normal, reconstruction_errors_failure]
+)
+all_true_labels = np.concatenate([y_test_normal_labels, y_test_failure_labels])
 
-    # --- Prediction on Fraud Test Data ---
-    y_true_labels_fraud = tf.ones(
-        tf.shape(X_test_fr)[0], dtype=tf.int32
-    )  # All true labels are 1 (failure)
-    fraud_test_errors = tf.constant([], dtype=tf.float32)  # Default empty
+# Calculate threshold based on normal data
+if len(reconstruction_errors_normal) > 0:
+    threshold = np.percentile(reconstruction_errors_normal, 95)
+    print(f"\nAnomaly Threshold (95th percentile of normal data): {threshold:.4f}")
+else:
+    threshold = 1.0
+    print(f"\nWarning: Using default threshold: {threshold:.4f}")
 
-    if tf.shape(X_test_fr)[0] > 0:
-        print(f"Predicting on {tf.shape(X_test_fr)[0]} failure test sequences...")
-        try:
-            X_test_fr_pred = model.predict(X_test_fr)
-            X_test_fr_clean = tf.where(tf.math.is_nan(X_test_fr), 0.0, X_test_fr)
-            X_test_fr_pred_clean = tf.where(
-                tf.math.is_nan(X_test_fr_pred), 0.0, X_test_fr_pred
-            )
-
-            fraud_test_errors = tf.reduce_mean(
-                tf.square(X_test_fr_clean - X_test_fr_pred_clean), axis=[1, 2]
-            )
-            if tf.reduce_any(tf.math.is_nan(fraud_test_errors)):
-                print("Warning: NaNs found in fraud reconstruction errors.")
-                fraud_test_errors = tf.where(
-                    tf.math.is_nan(fraud_test_errors),
-                    tf.zeros_like(fraud_test_errors),
-                    fraud_test_errors,
-                )
-
-            print("Prediction and error calculation on failure data complete.")
-        except Exception as e:
-            print(f"Error predicting or calculating errors on fraud data: {e}")
-            fraud_test_errors = tf.zeros_like(
-                y_true_labels_fraud, dtype=tf.float32
-            )  # Return zeros?
-            print(
-                "Proceeding with potentially zero reconstruction errors for fraud data."
-            )
-    else:
-        print("No failure test sequences to predict on.")
-
-    print("--- Evaluation Finished ---")
-    # Return errors for both normal and fraud test sets
-    return y_true_labels_fraud, fraud_test_errors, normal_test_errors, threshold_value
-
-
-# --- Anomaly Mapping and Saving Workflow Function ---
-def map_anomalies_and_save(
-    reconstruction_errors_val,  # Tensor
-    threshold,  # Float
-    fraud_record_ids_all,  # List of IDs
-    timesteps_val,  # Int
-    spark_session,  # SparkSession
-    original_df,  # DataFrame
-    output_dir_val,  # String path
-    output_filename_prefix,  # String prefix
-):
-    """Maps anomalous sequences (from failure data) back to original records and saves them."""
-    print("--- Starting Anomaly Mapping and Saving ---")
-    if not fraud_record_ids_all:
-        print("No fraud record IDs provided, skipping anomaly mapping.")
-        return
-
-    if tf.shape(reconstruction_errors_val)[0] == 0:
-        print(
-            "No reconstruction errors provided for fraud data, skipping anomaly mapping."
-        )
-        return
-
-    # Find indices of sequences where error exceeds threshold
-    anomalous_sequence_indices_tensor = tf.where(reconstruction_errors_val > threshold)
-    anomalous_sequence_indices = anomalous_sequence_indices_tensor.numpy().flatten()
-
-    if anomalous_sequence_indices.size == 0:
-        print("No anomalous sequences detected based on the threshold.")
-        return
-
-    print(
-        f"Mapping {len(anomalous_sequence_indices)} anomalous sequences from failure data to original record IDs..."
+# Calculate detection rates and save anomaly records
+print("\n--- Detection Rate Analysis ---")
+if len(reconstruction_errors_failure) > 0:
+    # Calculate detection rate for failure data
+    detected_failures = sum(
+        1 for error in reconstruction_errors_failure if error > threshold
+    )
+    total_failures = len(reconstruction_errors_failure)
+    detection_rate = (
+        (detected_failures / total_failures) * 100 if total_failures > 0 else 0
     )
 
-    anomalous_record_ids_set = set()
-    record_id_to_error_map = {}  # Store max error for each record ID
-    num_original_fraud_records = len(fraud_record_ids_all)
-
-    # Iterate through the *indices* of the anomalous sequences
-    for seq_idx in anomalous_sequence_indices:
-        # The sequence starting at seq_idx corresponds to original records from
-        # index seq_idx to seq_idx + timesteps_val - 1 in the *original* fraud data tensor/ID list.
-        start_record_idx = seq_idx
-        end_record_idx = seq_idx + timesteps_val  # Exclusive end
-
-        # Clip the end index to the actual number of fraud records
-        end_record_idx = min(end_record_idx, num_original_fraud_records)
-
-        # Get the error for this specific sequence
-        seq_error = reconstruction_errors_val[seq_idx].numpy()
-
-        # Map the record indices within this range back to the original record IDs
-        for i in range(start_record_idx, end_record_idx):
-            record_id = fraud_record_ids_all[i]
-            anomalous_record_ids_set.add(record_id)
-            # Keep the highest reconstruction error associated with the record ID
-            current_max_error = record_id_to_error_map.get(record_id, -1.0)
-            record_id_to_error_map[record_id] = max(current_max_error, float(seq_error))
-
-    num_unique_anomalous_records = len(anomalous_record_ids_set)
-    print(
-        f"Identified {num_unique_anomalous_records} unique failure records corresponding to {len(anomalous_sequence_indices)} anomalous sequences."
+    # Calculate false positive rate for normal test data
+    false_positives = sum(
+        1 for error in reconstruction_errors_normal if error > threshold
+    )
+    total_normal = len(reconstruction_errors_normal)
+    false_positive_rate = (
+        (false_positives / total_normal) * 100 if total_normal > 0 else 0
     )
 
-    if anomalous_record_ids_set:
-        # Convert the set to a list for Spark filtering
-        anomalous_record_ids_list = list(anomalous_record_ids_set)
+    print(f"Total failure sequences: {total_failures}")
+    print(f"Detected failures: {detected_failures}")
+    print(f"Detection rate: {detection_rate:.2f}%")
+    print(f"Total normal test sequences: {total_normal}")
+    print(f"False positives: {false_positives}")
+    print(f"False positive rate: {false_positive_rate:.2f}%")
 
-        # Filter the original DataFrame to get the full anomalous records
-        # Ensure record_id column type matches for the filter
-        anomalous_records_df = original_df.filter(
-            col("record_id").isin(anomalous_record_ids_list)
-        )
+    # Create output directories
+    output_dir = "./dataset/anomalies"
+    plots_dir = "./plots"
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
 
-        # Create a Spark DataFrame for the errors to join
-        error_map_pd = pd.DataFrame(
-            list(record_id_to_error_map.items()),
-            columns=["record_id", "max_reconstruction_error"],
-        )
-        error_map_spark = spark_session.createDataFrame(error_map_pd)
+    # Save detection rates
+    detection_rates_path = os.path.join(output_dir, f"detection_rates_{table_name}.txt")
+    with open(detection_rates_path, "w") as f:
+        f.write(f"Detection Rate Analysis for {table_name}\n")
+        f.write(f"Threshold: {threshold:.4f}\n")
+        f.write(f"Total failure sequences: {total_failures}\n")
+        f.write(f"Detected failures: {detected_failures}\n")
+        f.write(f"Detection rate: {detection_rate:.2f}%\n")
+        f.write(f"Total normal test sequences: {total_normal}\n")
+        f.write(f"False positives: {false_positives}\n")
+        f.write(f"False positive rate: {false_positive_rate:.2f}%\n")
 
-        # Join the original data with the max reconstruction error
-        final_anomalies_df = anomalous_records_df.join(
-            error_map_spark, "record_id", "left"
-        ).orderBy(col("max_reconstruction_error").desc())
+    # Save anomaly records
+    anomaly_records_path = os.path.join(output_dir, f"LSTM_AE_anomalies_{table_name}.csv")
 
-        print("Detected Anomalies Sample (Original Columns + Max Error):")
-        final_anomalies_df.show(truncate=False)
+    # Get indices of anomalies (both false positives and true failures)
+    anomaly_indices_normal = np.where(reconstruction_errors_normal > threshold)[0]
+    anomaly_indices_failure = np.where(reconstruction_errors_failure > threshold)[0]
 
-        # Save the results
-        anomaly_csv_path = os.path.join(
-            output_dir_val, f"{output_filename_prefix}_anomalies.csv"
-        )
+    # Create DataFrame with anomaly records
+    anomaly_records = []
+
+    # Add failure anomalies only
+    for idx in anomaly_indices_failure:
+        original_idx = corresponding_failure_pdf_indices[idx]
+        record = original_full_pdf.iloc[original_idx].to_dict()
+        record["reconstruction_error"] = reconstruction_errors_failure[idx]
+        record["is_failure"] = True
+        anomaly_records.append(record)
+
+    # Convert to DataFrame and save only the failure anomaly records
+    anomaly_df = pd.DataFrame(anomaly_records)
+    anomaly_df.to_csv(anomaly_records_path, index=False)
+    print(f"\nFailure anomaly records saved to: {anomaly_records_path}")
+
+    # Calculate and plot ROC curve
+    if len(all_true_labels) > 0 and len(np.unique(all_true_labels)) > 1:
         try:
-            final_anomalies_df.coalesce(1).write.csv(
-                anomaly_csv_path, header=True, mode="overwrite"
+            fpr, tpr, roc_thresholds = roc_curve(
+                all_true_labels, all_reconstruction_errors
             )
-            print(f"Detected anomalies saved to: {anomaly_csv_path}")
-        except Exception as e:
-            print(f"Error saving anomalies CSV: {e}")
-    else:
-        # This case is already handled by the check at the start of the block
-        pass
+            roc_auc = auc(fpr, tpr)
 
-    print("--- Anomaly Mapping and Saving Finished ---")
+            plt.figure(figsize=(10, 6))
+            plt.plot(
+                fpr,
+                tpr,
+                color="darkorange",
+                lw=2,
+                label=f"ROC curve (area = {roc_auc:.4f})",
+            )
+            plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel("False Positive Rate")
+            plt.ylabel("True Positive Rate")
+            plt.title(f"Receiver Operating Characteristic (ROC) - {table_name}")
+            plt.legend(loc="lower right")
+            plt.grid(True)
 
-
-# --- Metrics Calculation and Plotting Workflow Function ---
-def calculate_and_plot_metrics(
-    y_true_labels_fraud,  # Tensor (all 1s for fraud data)
-    fraud_scores_val,  # Tensor (reconstruction errors for failures)
-    normal_scores_val,  # Tensor (reconstruction errors for normal test data)
-    threshold_val,  # Float (pre-calculated threshold)
-    total_actual_failures,  # Int (count from raw fraud data)
-    plot_dir_val,  # String path
-    plot_filename_prefix,  # String prefix
-):
-    """Calculates detection metrics, ROC curve, and plots ROC."""
-    print("--- Starting Metrics Calculation and Plotting ---")
-
-    fraud_scores = fraud_scores_val.numpy()
-    normal_scores = normal_scores_val.numpy()
-
-    # --- Failure Detection Metrics (based on pre-calculated threshold) ---
-    detected_failures = 0
-    if fraud_scores.size > 0:
-        y_pred_labels_fraud_at_threshold = (fraud_scores > threshold_val).astype(int)
-        detected_failures = np.sum(y_pred_labels_fraud_at_threshold)
-    else:
-        print("No fraud prediction scores available for threshold-based metrics.")
-
-    missed_failures = total_actual_failures - detected_failures
-    missed_failures = max(0, missed_failures)
-
-    print(f"Metrics based on pre-calculated threshold ({threshold_val:.4f}):")
-    print(f"  Total Failure Records Expected (from input): {total_actual_failures}")
-    print(f"  Failure Test Sequences Evaluated: {fraud_scores.size}")
-    print(f"  Failures Detected as Anomalies (TP at threshold): {detected_failures}")
-    print(f"  Failures Missed (FN at threshold): {missed_failures}")
-
-    if total_actual_failures > 0:
-        detection_rate_at_threshold = (detected_failures / total_actual_failures) * 100
-        print(
-            f"  Failure Detection Rate (at threshold): {detection_rate_at_threshold:.2f}%"
-        )
-    else:
-        print(
-            "  No actual failure records for detection rate calculation at threshold."
-        )
-
-    # --- ROC Curve Calculation and Plotting ---
-    if normal_scores.size > 0 and fraud_scores.size > 0:
-        print("\nCalculating ROC curve...")
-        # True labels: 0 for normal, 1 for fraud
-        y_true_roc = np.concatenate(
-            [np.zeros(len(normal_scores)), np.ones(len(fraud_scores))]
-        )
-        # Scores: reconstruction errors
-        y_scores_roc = np.concatenate([normal_scores, fraud_scores])
-
-        fpr, tpr, thresholds_roc = roc_curve(y_true_roc, y_scores_roc)
-        roc_auc_value = auc(fpr, tpr)
-
-        print(f"Area Under ROC Curve (AUC): {roc_auc_value:.4f}")
-
-        plt.figure(figsize=(10, 7))
-        plt.plot(
-            fpr,
-            tpr,
-            color="darkorange",
-            lw=2,
-            label=f"ROC curve (area = {roc_auc_value:.2f})",
-        )
-        plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title(f"Receiver Operating Characteristic (ROC) - {plot_filename_prefix}")
-        plt.legend(loc="lower right")
-        plt.grid(True)
-        roc_plot_path = os.path.join(
-            plot_dir_val, f"{plot_filename_prefix}_ROC_curve.png"
-        )
-        try:
+            # Save ROC curve plot to plots directory
+            roc_plot_path = os.path.join(plots_dir, f"ROC_curve_{table_name}.png")
             plt.savefig(roc_plot_path)
-            print(f"ROC curve plot saved to: {roc_plot_path}")
-        except Exception as e:
-            print(f"Error saving ROC plot: {e}")
-        finally:
             plt.close()
+            print(f"ROC curve saved to {roc_plot_path}")
+        except Exception as e:
+            print(f"Error calculating ROC curve: {e}")
+    else:
+        print("\nNot enough data or only one class available for ROC curve generation.")
+else:
+    print("No failure data available for detection rate analysis.")
 
-        # --- Confusion Matrix (at the pre-calculated threshold) ---
-        # For the CM, we need predictions on normal data using the same threshold
-        if normal_scores.size > 0:
-            predictions_on_normal_at_threshold = (normal_scores > threshold_val).astype(
-                int
-            )
-            all_true_labels_cm = y_true_roc  # Same as for ROC
-            all_predictions_cm = np.concatenate(
-                [predictions_on_normal_at_threshold, y_pred_labels_fraud_at_threshold]
-            )
-
-            print(f"\nConfusion Matrix (at threshold {threshold_val:.4f}):")
-            try:
-                cm = confusion_matrix(all_true_labels_cm, all_predictions_cm)
-                print("         Predicted Normal  Predicted Failure")
-                print(f"Actual Normal    {cm[0,0]:<15}  {cm[0,1]:<17}")  # TN, FP
-                print(f"Actual Failure   {cm[1,0]:<15}  {cm[1,1]:<17}")  # FN, TP
-            except Exception as e:
-                print(f"Could not generate confusion matrix: {e}")
-        else:
-            print("\nSkipping confusion matrix: Normal scores not available.")
-
-    elif normal_scores.size == 0:
-        print("\nSkipping ROC curve calculation: Normal test scores are not available.")
-    elif fraud_scores.size == 0:
-        print("\nSkipping ROC curve calculation: Fraud test scores are not available.")
-
-    print("--- Metrics Calculation and Plotting Finished ---")
-
-
-def main():
-    """Main execution function."""
-    print("Starting LSTM Autoencoder for Anomaly Detection...")
-
-    # --- Load Data ---
-    df_all = load_data(spark, file_path)
-    raw_total_count = df_all.count()
-    print(f"Total records loaded: {raw_total_count}")
-
-    normal_records_raw = df_all.where(col("failure") == 0)
-    fraud_records_raw = df_all.where(col("failure") == 1)
-    normal_raw_count = normal_records_raw.count()
-    fraud_raw_count = fraud_records_raw.count()
-    print(f"Raw normal records count (limited): {normal_raw_count}")
-    print(f"Raw failure records count: {fraud_raw_count}")
-
-    if normal_raw_count == 0:
-        print(
-            "Error: No normal records found after filtering and limiting. Cannot train model."
-        )
-        return  # Exit if no training data
-
-    # --- Preprocess Data --- #
-    print("Preprocessing normal data...")
-    # Preprocess normal data first to establish the reference schema
-    normal_records = preprocess_data(normal_records_raw)
-    reference_schema = normal_records.schema
-    print(f"Reference schema established with {len(reference_schema.fields)} fields.")
-    normal_records.cache()  # Cache preprocessed normal data
-    normal_processed_count = (
-        normal_records.count()
-    )  # Count after potential null column removal
-    print(f"Processed normal records count: {normal_processed_count}")
-
-    if normal_processed_count == 0:
-        print(
-            "Error: No normal records remaining after preprocessing. Cannot train model."
-        )
-        return
-
-    # Preprocess fraud data, aligning to the reference schema
-    print("Preprocessing failure data...")
-    fraud_records = preprocess_data(fraud_records_raw, reference_schema)
-    fraud_records.cache()  # Cache preprocessed fraud data
-    fraud_processed_count = fraud_records.count()
-    print(f"Processed failure records count: {fraud_processed_count}")
-
-    # --- Feature Engineering --- #
-    print("Creating and fitting feature pipeline...")
-    # Create pipeline based on the schema of *processed* normal data
-    pipeline = create_feature_pipeline(normal_records.schema)
-    fitted_pipeline = pipeline.fit(normal_records)
-    print("Feature pipeline fitted.")
-    # Optional: Save the fitted pipeline
-    # fitted_pipeline.save(f"./ml_models/feature_pipeline_{table_name}")
-
-    # Unpersist raw DFs if no longer needed
-    normal_records_raw.unpersist()
-    fraud_records_raw.unpersist()
-
-    # --- Prepare Data for TF Model --- #
-    (
-        X_train,
-        X_val,
-        X_test_normal,  # Kept but unused in current evaluation
-        X_test_fraud,
-        normal_record_ids,
-        fraud_record_ids,
-        n_features,
-        normal_data_tensor,  # Needed for threshold calc
-    ) = prepare_sequences_for_model(
-        normal_records,  # Use processed data
-        fraud_records,  # Use processed data
-        fitted_pipeline,
-        timesteps,
-    )
-
-    # Unpersist processed DFs after tensor conversion
-    normal_records.unpersist()
-    fraud_records.unpersist()
-    gc.collect()  # Suggest garbage collection
-
-    # --- Model Training --- #
-    strategy = tf.distribute.MirroredStrategy()
-    print(f"Training using strategy: {strategy}")
-    model, history = train_lstm_ae_model(
-        X_train,
-        X_val,
-        n_features,
-        timesteps,
-        f"LSTM_AE_{table_name}",  # Pass prefix for model naming
-        strategy,
-        epochs=10,  # Make epochs configurable
-        patience=3,  # Make patience configurable
-    )
-
-    # --- Evaluation --- #
-    y_true_labels_fraud, fraud_scores_val, normal_scores_val, threshold = (
-        predict_and_evaluate(
-            model, X_train, X_test_normal, X_test_fraud  # Pass all required data
-        )
-    )
-
-    # --- Anomaly Mapping --- #
-    map_anomalies_and_save(
-        fraud_scores_val,  # Use fraud scores for anomaly mapping
-        threshold,
-        fraud_record_ids,
-        timesteps,
-        spark,
-        df_all,
-        output_dir,
-        f"LSTM_AE_{table_name}",
-    )
-
-    # --- Metrics Reporting --- #
-    calculate_and_plot_metrics(
-        y_true_labels_fraud,  # Labels corresponding to fraud_scores_val
-        fraud_scores_val,  # Errors for fraud data
-        normal_scores_val,  # Errors for normal data
-        threshold,
-        fraud_raw_count,
-        plot_dir,
-        f"LSTM_AE_{table_name}",
-    )
-
-    print("LSTM Autoencoder script finished.")
-
-
-# --- Script Entry Point --- #
-if __name__ == "__main__":
-    main()
+print("\nScript finished.")
