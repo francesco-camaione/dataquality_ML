@@ -11,21 +11,24 @@ import keras
 import numpy as np
 from lib.utils import ms_error_ae, infer_column_types_from_schema, boolean_columns
 
-table_name = "2024_12_backblaze_150k"
+table_name = "2024_12_bb_3d"
 
 spark = (
     SparkSession.builder.appName("App")
     .master("local[*]")
-    .config("spark.executor.memory", "8g")
+    .config("spark.executor.memory", "4g")
+    .config("spark.driver.memory", "4g")
     .getOrCreate()
 )
 
 # Load and split dataset
 raw_df = (
-    spark.read.option("header", "true")
-    .csv(f"./dataset/{table_name}.csv", inferSchema=True)
-    .limit(20000)
-).repartition(8)
+    spark.read.option("header", "true").csv(
+        f"./dataset/{table_name}.csv", inferSchema=True
+    )
+).repartition(32)
+
+print("df has ", raw_df.count(), " records")
 
 boolean_cols = boolean_columns(raw_df.schema)
 if boolean_cols:
@@ -34,10 +37,11 @@ if boolean_cols:
             column, functions.col(column).cast(types.IntegerType())
         )
 
-# Separate normal vs fraud
+# Separate normal vs fraud without caching
 df_norm = raw_df.where(raw_df["failure"] == 0)
 df_fraud = raw_df.where(raw_df["failure"] == 1)
 print("number of failure records in the raw_df: ", df_fraud.count())
+raw_df.unpersist()  
 
 # Infer schema & build feature pipeline
 categorical_cols, numerical_cols = infer_column_types_from_schema(df_norm.schema)
@@ -45,7 +49,6 @@ categorical_cols, numerical_cols = infer_column_types_from_schema(df_norm.schema
 # Identify numerical columns that are entirely null or NaN in df_norm
 problematic_numerical_cols = []
 for col_name in numerical_cols:
-    # Check if all values are null or NaN for the column in df_norm
     if (
         df_norm.where(
             functions.col(col_name).isNotNull()
@@ -62,18 +65,17 @@ valid_numerical_cols = [
     c for c in numerical_cols if c not in problematic_numerical_cols
 ]
 
+# Process data in a single pipeline to minimize memory usage
+print("Building and fitting pipeline...")
 indexers = [
     StringIndexer(inputCol=c, outputCol=c + "_idx", handleInvalid="keep")
     for c in categorical_cols
 ]
-# Use valid_numerical_cols for feature_cols
-feature_cols = (
-    [c + "_idx" for c in categorical_cols] + valid_numerical_cols + boolean_cols
-)
-
-# Use valid_numerical_cols for the Imputer
 imputer = Imputer(
     inputCols=valid_numerical_cols, outputCols=valid_numerical_cols, strategy="mean"
+)
+feature_cols = (
+    [c + "_idx" for c in categorical_cols] + valid_numerical_cols + boolean_cols
 )
 assembler = VectorAssembler(
     inputCols=feature_cols, outputCol="assembled_features", handleInvalid="keep"
@@ -83,24 +85,32 @@ scaler = StandardScaler(
 )
 
 pipeline = Pipeline(stages=[imputer] + indexers + [assembler, scaler])
-
 fitted_pipeline = pipeline.fit(df_norm)
+
+print("Transforming normal data...")
 proc_norm_df = fitted_pipeline.transform(df_norm)
 
+print("Transforming fraud data...")
 proc_fraud_df = fitted_pipeline.transform(df_fraud)
 
-# Convert to numpy arrays
-norm_pdf = proc_norm_df.select("features").toPandas()
-fraud_pdf = proc_fraud_df.select("features").toPandas()
+# Convert to numpy arrays in batches to minimize memory usage
+print("Converting normal data to numpy arrays...")
+norm_vectors = []
+for row in proc_norm_df.select("features").collect():
+    norm_vectors.append(row.features.toArray())
+X_train = np.vstack(norm_vectors).astype(np.float32)
 
-# Collect each row's Spark Vector (from the "features" column), convert to a NumPy array,
-# and vertically stack them into a single 2D float32 array
-X_train = np.vstack(norm_pdf["features"].apply(lambda v: v.toArray()).tolist()).astype(
-    np.float32
-)
-X_test = np.vstack(fraud_pdf["features"].apply(lambda v: v.toArray()).tolist()).astype(
-    np.float32
-)
+print("Converting fraud data to numpy arrays...")
+fraud_vectors = []
+for row in proc_fraud_df.select("features").collect():
+    fraud_vectors.append(row.features.toArray())
+X_test = np.vstack(fraud_vectors).astype(np.float32)
+
+# Clean up DataFrames
+df_norm.unpersist()
+df_fraud.unpersist()
+proc_norm_df.unpersist()
+proc_fraud_df.unpersist()
 
 if not os.path.exists(f"./ml_models/AE_{table_name}.keras"):
     # train the model
@@ -156,7 +166,7 @@ if not os.path.exists(f"./ml_models/AE_{table_name}.keras"):
     history = autoencoder.fit(
         X_train,
         X_train,
-        epochs=150,
+        epochs=100,
         batch_size=256,
         validation_split=0.2,
         callbacks=[early_stopping, reduce_lr],
