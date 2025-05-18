@@ -34,11 +34,58 @@ def infer_column_types_from_schema(schema: StructType) -> tuple[list[str], list[
 
 
 def ms_error_ae(test_data, reconstructed_data):
-    return np.mean(np.power(test_data - reconstructed_data, 2), axis=(1))
+    # Calculate variance for each feature
+    feature_variances = np.var(test_data, axis=0)
+    # Avoid division by zero by replacing zero variances with 1
+    feature_variances = np.where(feature_variances == 0, 1, feature_variances)
+    # Calculate weighted MSE
+    squared_errors = np.power(test_data - reconstructed_data, 2)
+    weighted_errors = squared_errors / feature_variances
+    return np.mean(weighted_errors, axis=1)
+
+
+def mae_error_ae(test_data, reconstructed_data):
+    # Calculate variance for each feature
+    feature_variances = np.var(test_data, axis=0)
+    # Set a minimum variance threshold to avoid numerical instability
+    min_variance = 1e-6
+    feature_variances = np.maximum(feature_variances, min_variance)
+    # Calculate absolute errors
+    abs_errors = np.abs(test_data - reconstructed_data)
+    # Weight the errors by feature variances
+    weighted_errors = abs_errors / feature_variances
+    # Clip extreme values to avoid infinity
+    weighted_errors = np.clip(weighted_errors, 0, 1e6)
+    return np.mean(weighted_errors, axis=1)
 
 
 def ms_error(test_data, reconstructed_data):
-    return np.mean(np.power(test_data - reconstructed_data, 2), axis=(1, 2))
+    # Calculate variance for each feature across all timesteps and samples
+    feature_variances = np.var(test_data.reshape(-1, test_data.shape[-1]), axis=0)
+    # Set a minimum variance threshold to avoid numerical instability
+    min_variance = 1e-6
+    feature_variances = np.maximum(feature_variances, min_variance)
+    # Calculate squared errors
+    squared_errors = np.power(test_data - reconstructed_data, 2)
+    # Weight the errors by feature variances
+    weighted_errors = squared_errors / feature_variances
+    # Clip extreme values to avoid infinity
+    weighted_errors = np.clip(weighted_errors, 0, 1e6)
+    # Average across both timesteps and features
+    return np.mean(weighted_errors, axis=(1, 2))
+
+
+def mae_error(test_data, reconstructed_data):
+    # Calculate variance for each feature across all timesteps and samples
+    feature_variances = np.var(test_data.reshape(-1, test_data.shape[-1]), axis=0)
+    # Avoid division by zero by replacing zero variances with 1
+    feature_variances = np.where(feature_variances == 0, 1, feature_variances)
+    # Calculate absolute errors
+    abs_errors = np.abs(test_data - reconstructed_data)
+    # Weight the errors by feature variances
+    weighted_errors = abs_errors / feature_variances
+    # Average across both timesteps and features
+    return np.mean(weighted_errors, axis=(1, 2))
 
 
 def create_sequences(data: np.ndarray, timesteps: int) -> np.ndarray:
