@@ -2,6 +2,7 @@ iceberg_catalog/
 app/prova.py
 spark-warehouse/
 dataset/2024_12_backblaze.csv
+dataset/2024_12_bb_3d.csv
 TODO.txt
 # Environment variables
 .env
