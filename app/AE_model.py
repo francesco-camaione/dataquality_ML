@@ -9,7 +9,7 @@ from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
 import keras
 import numpy as np
-from lib.utils import ms_error_ae, infer_column_types_from_schema, boolean_columns
+from lib.utils import mae_error_ae, infer_column_types_from_schema, boolean_columns
 
 table_name = "2024_12_bb_3d"
 
@@ -41,7 +41,7 @@ if boolean_cols:
 df_norm = raw_df.where(raw_df["failure"] == 0)
 df_fraud = raw_df.where(raw_df["failure"] == 1)
 print("number of failure records in the raw_df: ", df_fraud.count())
-raw_df.unpersist()  
+raw_df.unpersist()
 
 # Infer schema & build feature pipeline
 categorical_cols, numerical_cols = infer_column_types_from_schema(df_norm.schema)
@@ -119,15 +119,17 @@ if not os.path.exists(f"./ml_models/AE_{table_name}.keras"):
 
     # Encoder with L2 regularization
     encoded = keras.layers.Dense(
-        256, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
+        512, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
     )(input_layer)
     encoded = keras.layers.BatchNormalization()(encoded)
-    encoded = keras.layers.Dropout(0.3)(encoded)
+    encoded = keras.layers.Dense(
+        256, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
+    )(encoded)
+    encoded = keras.layers.BatchNormalization()(encoded)
     encoded = keras.layers.Dense(
         128, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
     )(encoded)
     encoded = keras.layers.BatchNormalization()(encoded)
-    encoded = keras.layers.Dropout(0.3)(encoded)
     latent_space = keras.layers.Dense(
         64, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
     )(encoded)
@@ -135,23 +137,25 @@ if not os.path.exists(f"./ml_models/AE_{table_name}.keras"):
 
     # Decoder with L2 regularization
     decoded = keras.layers.Dense(
-        128, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
+        128, activation="linear", kernel_regularizer=keras.regularizers.l2(0.001)
     )(latent_space)
     decoded = keras.layers.BatchNormalization()(decoded)
-    decoded = keras.layers.Dropout(0.3)(decoded)
     decoded = keras.layers.Dense(
-        256, activation="relu", kernel_regularizer=keras.regularizers.l2(0.001)
+        256, activation="linear", kernel_regularizer=keras.regularizers.l2(0.001)
     )(decoded)
     decoded = keras.layers.BatchNormalization()(decoded)
-    decoded = keras.layers.Dropout(0.3)(decoded)
-    decoded = keras.layers.Dense(input_dim, activation="sigmoid")(decoded)
+    decoded = keras.layers.Dense(
+        512, activation="linear", kernel_regularizer=keras.regularizers.l2(0.001)
+    )(decoded)
+    decoded = keras.layers.BatchNormalization()(decoded)
+    decoded = keras.layers.Dense(input_dim, activation="linear")(decoded)
 
     autoencoder = keras.models.Model(inputs=input_layer, outputs=decoded)
 
     # Use a fixed initial learning rate with ReduceLROnPlateau
     initial_lr = 0.001
     optimizer = keras.optimizers.legacy.Adam(learning_rate=initial_lr)
-    autoencoder.compile(optimizer=optimizer, loss="mean_squared_error")
+    autoencoder.compile(optimizer=optimizer, loss="mae")
 
     # Enhanced early stopping
     early_stopping = keras.callbacks.EarlyStopping(
@@ -166,7 +170,7 @@ if not os.path.exists(f"./ml_models/AE_{table_name}.keras"):
     history = autoencoder.fit(
         X_train,
         X_train,
-        epochs=100,
+        epochs=50,
         batch_size=256,
         validation_split=0.2,
         callbacks=[early_stopping, reduce_lr],
@@ -175,15 +179,20 @@ if not os.path.exists(f"./ml_models/AE_{table_name}.keras"):
     autoencoder.save(f"./ml_models/AE_{table_name}.keras")
 
 #  Load trained model & predict
-autoencoder = keras.models.load_model(f"./ml_models/AE_{table_name}.keras")
+autoencoder = keras.models.load_model(
+    f"./ml_models/AE_{table_name}.keras", compile=False
+)
+optimizer = keras.optimizers.legacy.Adam(learning_rate=0.001)
+
+autoencoder.compile(optimizer=optimizer, loss="mae")
 reconstructed = autoencoder.predict(X_test)
-mse = ms_error_ae(X_test, reconstructed)
+mae = mae_error_ae(X_test, reconstructed)
 
 reconstructed_train = autoencoder.predict(X_train)
-mse_train_normal = ms_error_ae(X_train, reconstructed_train)
+mae_train_normal = mae_error_ae(X_train, reconstructed_train)
 
-threshold = np.percentile(mse_train_normal, 95)
-anomalies = mse > threshold
+threshold = np.percentile(mae_train_normal, 95)
+anomalies = mae > threshold
 
 # Metrics
 detected = np.sum(anomalies)
@@ -211,7 +220,7 @@ raw_fraud_pdf = df_fraud_for_pandas.toPandas()
 
 anomaly_table = raw_fraud_pdf.iloc[anomaly_idxs]
 # Add reconstruction error to the anomaly table
-anomaly_table["reconstruction_error"] = mse[anomaly_idxs]
+anomaly_table["reconstruction_error"] = mae[anomaly_idxs]
 
 print("Anomaly table (raw fraud records flagged):")
 print(anomaly_table)
@@ -223,16 +232,16 @@ from sklearn.metrics import roc_curve, auc, confusion_matrix
 
 # 1. Get reconstruction errors for the training (normal) data
 reconstructed_train = autoencoder.predict(X_train)
-mse_train_normal = ms_error_ae(X_train, reconstructed_train)
+mae_train_normal = mae_error_ae(X_train, reconstructed_train)
 
-# mse is already calculated for X_test (fraud data) in the existing code
-mse_test = mse
+# mae is already calculated for X_test (fraud data) in the existing code
+mae_test = mae
 
 # 2. Create combined true labels and scores for ROC analysis
-y_true = np.concatenate([np.zeros(len(mse_train_normal)), np.ones(len(mse_test))])
+y_true = np.concatenate([np.zeros(len(mae_train_normal)), np.ones(len(mae_test))])
 
 # Scores: reconstruction errors
-y_scores = np.concatenate([mse_train_normal, mse_test])
+y_scores = np.concatenate([mae_train_normal, mae_test])
 
 # 3. Calculate ROC curve and AUC
 fpr, tpr, thresholds_roc = roc_curve(y_true, y_scores)
@@ -257,7 +266,7 @@ print(f"ROC curve plot saved to: /plots/ROC_Curve_AE_{table_name}.png")
 # 5. Calculate and print Confusion Matrix and Classification Report
 # Using the threshold based on normal data distribution
 # Predictions for normal data using this threshold
-predictions_on_normal_data = mse_train_normal > threshold
+predictions_on_normal_data = mae_train_normal > threshold
 
 all_predictions = np.concatenate([predictions_on_normal_data, anomalies])
 

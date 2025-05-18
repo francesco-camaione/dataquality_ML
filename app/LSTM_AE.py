@@ -16,7 +16,7 @@ from keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
 from keras.optimizers.legacy import Adam
 from lib.utils import (
     create_sequences,
-    ms_error,
+    mae_error,
     infer_column_types_from_schema,
     plot_roc_curve,
 )
@@ -217,21 +217,52 @@ def preprocess_data(spark, table_name_arg, timesteps_arg):
         f"Shape of failure_data (NumPy before create_sequences): {failure_data.shape}"
     )
 
+    # Create sequences for normal data
     X_normal_sequences = create_sequences(normal_data, timesteps_arg)
-    # original_indices_normal_local = normal_pdf.index[
-    # timesteps_arg - 1 : len(normal_pdf) - timesteps_arg + 1 + timesteps_arg - 1
-    # ] # This was unused
 
-    X_failure_sequences = create_sequences(failure_data, timesteps_arg)
+    # Create sequences for failure data that preserve all failure records
+    if len(failure_data) > 0:
+        # Create a sliding window of sequences, but ensure each failure record is in at least one sequence
+        X_failure_sequences = []
+        failure_indices = []
+
+        # For each failure record, create a sequence centered around it
+        for i in range(len(failure_data)):
+            # Calculate start and end indices for the sequence
+            start_idx = max(0, i - timesteps_arg // 2)
+            end_idx = min(len(failure_data), i + timesteps_arg // 2)
+
+            # If we don't have enough records before or after, adjust the sequence
+            if end_idx - start_idx < timesteps_arg:
+                if start_idx == 0:
+                    end_idx = min(len(failure_data), timesteps_arg)
+                else:
+                    start_idx = max(0, end_idx - timesteps_arg)
+
+            # Create the sequence
+            sequence = failure_data[start_idx:end_idx]
+
+            # If sequence is shorter than timesteps_arg, pad with normal data
+            if len(sequence) < timesteps_arg:
+                padding_needed = timesteps_arg - len(sequence)
+                if start_idx == 0:  # Pad at the beginning
+                    padding_data = normal_data[:padding_needed]
+                    sequence = np.vstack([padding_data, sequence])
+                else:  # Pad at the end
+                    padding_data = normal_data[:padding_needed]
+                    sequence = np.vstack([sequence, padding_data])
+
+            X_failure_sequences.append(sequence)
+            failure_indices.append(i)
+
+        X_failure_sequences = np.array(X_failure_sequences)
+    else:
+        X_failure_sequences = np.empty((0, timesteps_arg, normal_data.shape[1]))
+        failure_indices = []
+
     print(
         f"Shape of X_failure_sequences (NumPy after create_sequences): {X_failure_sequences.shape}"
     )
-    corresponding_failure_pdf_indices_local = []
-    if len(X_failure_sequences) > 0:
-        for i in range(len(failure_data) - timesteps_arg + 1):
-            corresponding_failure_pdf_indices_local.append(
-                failure_pdf_original_indices_local[i]
-            )
 
     if X_normal_sequences.ndim > 1 and X_normal_sequences.shape[0] > 0:
         train_size_normal = int(0.8 * len(X_normal_sequences))
@@ -278,7 +309,7 @@ def preprocess_data(spark, table_name_arg, timesteps_arg):
         y_test_normal_labels_local,
         y_test_failure_labels_local,
         failure_pdf_original_indices_local,
-        corresponding_failure_pdf_indices_local,
+        failure_indices,  # Return the failure indices for proper tracking
     )
 
 
@@ -302,16 +333,16 @@ def load_or_create_model(
     else:
         print("Defining and training a new model...")
         input_seq = Input(shape=(timesteps_arg, n_features_arg))
-        encoded = LSTM(32, activation="relu", return_sequences=True)(input_seq)
-        encoded = LSTM(16, activation="relu")(encoded)
+        encoded = LSTM(32, activation="tanh", return_sequences=True)(input_seq)
+        encoded = LSTM(16, activation="tanh")(encoded)
         decoded = RepeatVector(timesteps_arg)(encoded)
-        decoded = LSTM(16, activation="relu", return_sequences=True)(decoded)
-        decoded = LSTM(32, activation="relu", return_sequences=True)(decoded)
+        decoded = LSTM(16, activation="tanh", return_sequences=True)(decoded)
+        decoded = LSTM(32, activation="tanh", return_sequences=True)(decoded)
         decoded = TimeDistributed(Dense(n_features_arg))(decoded)
         lstm_ae_model = Model(inputs=input_seq, outputs=decoded)
 
         optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
-        lstm_ae_model.compile(optimizer=optimizer, loss="mse")
+        lstm_ae_model.compile(optimizer=optimizer, loss="mae")
         lstm_ae_model.summary()
 
         if np.any(np.isnan(X_train_arg)) or np.any(np.isinf(X_train_arg)):
@@ -349,47 +380,17 @@ def load_or_create_model(
 
 def predict_and_evaluate(model, X_test_normal_arg, X_test_failure_arg):
     """
-    Performs predictions and evaluates reconstruction errors.
+    Predicts and evaluates the model on test data.
     """
-    X_test_normal_pred = model.predict(X_test_normal_arg, verbose=1)
-    if np.any(np.isnan(X_test_normal_pred)):
-        print("\nWARNING: Predictions on normal test data contain NaNs!")
-        print(
-            f"Number of NaNs in X_test_normal_pred: {np.sum(np.isnan(X_test_normal_pred))}"
-        )
-        X_test_normal_pred = np.nan_to_num(X_test_normal_pred, nan=0.0)
-    else:
-        print("\nNo NaNs found in X_test_normal_pred.")
+    # Predict on normal test data
+    reconstructed_normal = model.predict(X_test_normal_arg)
+    reconstruction_errors_normal = mae_error(X_test_normal_arg, reconstructed_normal)
 
-    reconstruction_errors_normal_local = ms_error(X_test_normal_arg, X_test_normal_pred)
-    if np.any(np.isnan(reconstruction_errors_normal_local)):
-        reconstruction_errors_normal_local = np.nan_to_num(
-            reconstruction_errors_normal_local, nan=0.0
-        )
+    # Predict on failure test data
+    reconstructed_failure = model.predict(X_test_failure_arg)
+    reconstruction_errors_failure = mae_error(X_test_failure_arg, reconstructed_failure)
 
-    if X_test_failure_arg.shape[0] > 0:
-        X_test_failure_pred = model.predict(X_test_failure_arg, verbose=1)
-        if np.any(np.isnan(X_test_failure_pred)):
-            print("\nWARNING: Predictions on failure test data contain NaNs!")
-            print(
-                f"Number of NaNs in X_test_failure_pred: {np.sum(np.isnan(X_test_failure_pred))}"
-            )
-            X_test_failure_pred = np.nan_to_num(X_test_failure_pred, nan=0.0)
-        else:
-            print("\nNo NaNs found in X_test_failure_pred.")
-
-        reconstruction_errors_failure_local = ms_error(
-            X_test_failure_arg, X_test_failure_pred
-        )
-        if np.any(np.isnan(reconstruction_errors_failure_local)):
-            print("\nWARNING: Reconstruction errors for failure data contain NaNs!")
-            reconstruction_errors_failure_local = np.nan_to_num(
-                reconstruction_errors_failure_local, nan=0.0
-            )
-    else:
-        reconstruction_errors_failure_local = np.array([])
-
-    return reconstruction_errors_normal_local, reconstruction_errors_failure_local
+    return reconstruction_errors_normal, reconstruction_errors_failure
 
 
 def generate_anomaly_report(
@@ -397,63 +398,94 @@ def generate_anomaly_report(
     reconstruction_errors_failure_arg,
     threshold_arg,
     original_full_pdf_arg,
-    corresponding_failure_pdf_indices_arg,
+    all_failure_original_indices_arg,
+    timesteps_arg,
     table_name_arg,
 ):
     """
-    Generates and saves the anomaly report.
+    Generates and saves the anomaly report, listing all unique original records
+    from detected anomalous sequences.
     """
-    if len(reconstruction_errors_failure_arg) > 0:
-        detected_failures = sum(
-            1 for error in reconstruction_errors_failure_arg if error > threshold_arg
-        )
-        total_failures = len(reconstruction_errors_failure_arg)
-        detection_rate = (
-            (detected_failures / total_failures) * 100 if total_failures > 0 else 0
-        )
-        false_positives = sum(
-            1 for error in reconstruction_errors_normal_arg if error > threshold_arg
-        )
-        total_normal = len(reconstruction_errors_normal_arg)
-        false_positive_rate = (
-            (false_positives / total_normal) * 100 if total_normal > 0 else 0
-        )
+    anomaly_records = []
+    added_original_indices = set()
 
-        print(f"Total failure sequences: {total_failures}")
-        print(f"Detected failures: {detected_failures}")
-        print(f"Detection rate: {detection_rate:.2f}%")
-        print(f"Total normal test sequences: {total_normal}")
-        print(f"False positives: {false_positives}")
-        print(f"False positive rate: {false_positive_rate:.2f}%")
-        print(f"Detection Rate Analysis for {table_name_arg}\n")
-        print(f"Threshold: {threshold_arg:.4f}\n")
-        print(f"Total failure sequences: {total_failures}\n")
-        print(f"Detected failures: {detected_failures}\n")
-        print(f"Detection rate: {detection_rate:.2f}%\n")
-        print(f"Total normal test sequences: {total_normal}\n")
-        print(f"False positives: {false_positives}\n")
-        print(f"False positive rate: {false_positive_rate:.2f}%\n")
+    detected_failure_sequences_count = 0
+    total_failure_sequences = len(reconstruction_errors_failure_arg)
 
+    if total_failure_sequences > 0:
+        anomalous_sequence_indices = np.where(
+            reconstruction_errors_failure_arg > threshold_arg
+        )[0]
+        detected_failure_sequences_count = len(anomalous_sequence_indices)
+
+        for sequence_idx in anomalous_sequence_indices:
+            # This sequence (sequence_idx) is anomalous.
+            # It was formed from failure_data[sequence_idx] to failure_data[sequence_idx + timesteps_arg - 1]
+            for j in range(timesteps_arg):
+                failure_record_inner_idx = sequence_idx + j
+                if failure_record_inner_idx < len(all_failure_original_indices_arg):
+                    original_pdf_index = all_failure_original_indices_arg[
+                        failure_record_inner_idx
+                    ]
+
+                    if original_pdf_index not in added_original_indices:
+                        record = original_full_pdf_arg.iloc[
+                            original_pdf_index
+                        ].to_dict()
+                        # Assign the reconstruction error of the sequence to each record from it
+                        record["reconstruction_error_sequence"] = (
+                            reconstruction_errors_failure_arg[sequence_idx]
+                        )
+                        record["is_failure"] = (
+                            True  # These records are from failure_data
+                        )
+                        anomaly_records.append(record)
+                        added_original_indices.add(original_pdf_index)
+
+    # Calculate false positive rate for normal test data
+    false_positives_sequences = sum(
+        1 for error in reconstruction_errors_normal_arg if error > threshold_arg
+    )
+    total_normal_sequences = len(reconstruction_errors_normal_arg)
+    false_positive_rate = (
+        (false_positives_sequences / total_normal_sequences) * 100
+        if total_normal_sequences > 0
+        else 0
+    )
+
+    detection_rate_sequences = (
+        (detected_failure_sequences_count / total_failure_sequences) * 100
+        if total_failure_sequences > 0
+        else 0
+    )
+
+    print(f"Total failure sequences presented to model: {total_failure_sequences}")
+    print(f"Detected anomalous failure sequences: {detected_failure_sequences_count}")
+    print(f"Sequence-based detection rate: {detection_rate_sequences:.2f}%")
+    print(
+        f"Total unique original failure records identified in anomalous sequences: {len(added_original_indices)}"
+    )
+    print(f"Total normal test sequences: {total_normal_sequences}")
+    print(
+        f"False positive sequences (normal sequences flagged as anomaly): {false_positives_sequences}"
+    )
+    print(f"False positive rate (sequences): {false_positive_rate:.2f}%")
+
+    # Save anomaly records
+    if anomaly_records:
         output_dir = "./dataset/anomalies"
         os.makedirs(output_dir, exist_ok=True)
         anomaly_records_path = os.path.join(
             output_dir, f"LSTM_AE_anomalies_{table_name_arg}.csv"
         )
-        anomaly_indices_failure = np.where(
-            reconstruction_errors_failure_arg > threshold_arg
-        )[0]
-        anomaly_records = []
-
-        for idx in anomaly_indices_failure:
-            original_idx = corresponding_failure_pdf_indices_arg[idx]
-            record = original_full_pdf_arg.iloc[original_idx].to_dict()
-            record["reconstruction_error"] = reconstruction_errors_failure_arg[idx]
-            record["is_failure"] = True
-            anomaly_records.append(record)
-
         anomaly_df = pd.DataFrame(anomaly_records)
+        print(f"Anomaly records: {anomaly_df}")
         anomaly_df.to_csv(anomaly_records_path, index=False)
-        print(f"Failure anomaly records saved to: {anomaly_records_path}")
+        print(
+            f"Unique original failure records from anomalous sequences saved to: {anomaly_records_path}"
+        )
+    else:
+        print("No unique original failure records identified in anomalous sequences.")
 
 
 def main():
@@ -475,8 +507,8 @@ def main():
         X_test_failure_main,
         y_test_normal_labels_main,
         y_test_failure_labels_main,
-        _,
-        corresponding_failure_pdf_indices_main,
+        failure_pdf_original_indices_main,
+        failure_indices_main,
     ) = preprocess_data(spark_main, table_name_main, timesteps_main)
 
     if X_train_main.shape[0] == 0 or X_train_main.shape[2] == 0:
@@ -516,7 +548,8 @@ def main():
         reconstruction_errors_failure_main,
         threshold_main,
         original_full_pdf_main,
-        corresponding_failure_pdf_indices_main,
+        failure_pdf_original_indices_main,
+        timesteps_main,
         table_name_main,
     )
 
