@@ -1,4 +1,10 @@
 iceberg_catalog/
+app/prova.py
+spark-warehouse/
+dataset/2024_12_backblaze.csv
+dataset/2024_12_bb_3d.csv
+TODO.txt
+
 # Environment variables
 .env
 .env.*
@@ -16,7 +22,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -39,8 +44,6 @@ env/
 *.swo
 .DS_Store
 
-# Jupyter Notebook
-.ipynb_checkpoints
 
 # Logs
 *.log
