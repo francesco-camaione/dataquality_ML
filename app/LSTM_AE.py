@@ -328,7 +328,7 @@ def load_or_create_model(
         print(f"Loading existing model from {full_model_path}")
         lstm_ae_model = load_model(full_model_path, compile=False)
         optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
-        lstm_ae_model.compile(optimizer=optimizer, loss="mse")
+        lstm_ae_model.compile(optimizer=optimizer, loss="mae")
         print("Model loaded and compiled successfully.")
     else:
         print("Defining and training a new model...")
@@ -359,12 +359,6 @@ def load_or_create_model(
         early_stopping = tf.keras.callbacks.EarlyStopping(
             monitor="val_loss", patience=3, restore_best_weights=True
         )
-        model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
-            full_model_path,
-            monitor="val_loss",
-            save_best_only=True,
-            save_format="keras",
-        )
         history = lstm_ae_model.fit(
             X_train_arg,
             X_train_arg,
@@ -372,7 +366,7 @@ def load_or_create_model(
             batch_size=32,
             validation_split=0.2,
             shuffle=True,
-            callbacks=[early_stopping, model_checkpoint],
+            callbacks=[early_stopping],
         )
         print(f"New model saved to {full_model_path}")
     return lstm_ae_model
