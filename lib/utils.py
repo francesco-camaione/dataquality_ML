@@ -137,27 +137,10 @@ def plot_roc_curve(all_true_labels_arg, all_reconstruction_errors_arg, table_nam
         plt.grid(True)
 
         roc_plot_path = os.path.join(
-            plots_dir, f"ROC_Curve_LSTM_AE_{table_name_arg}.png"
+            plots_dir, f"ROC_Curve_AE_{table_name_arg}.png"
         )
         plt.savefig(roc_plot_path)
         plt.close()
         print(f"ROC curve saved to {roc_plot_path}")
+    return
 
-
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-
-    spark = (
-        SparkSession.builder.appName("App")
-        .config("spark.driver.bindAddress", "127.0.0.1")
-        .getOrCreate()
-    )
-
-    df = spark.read.option("header", "true").csv(
-        "./dataset/unpivoted_data_10k.csv",
-        inferSchema=True,
-    )
-    # here I assume that spark Dataframe infer data types correctly while reading data from iceberg tables/csv files
-    categorical_cols, numerical_cols = infer_column_types_from_schema(df.schema)
-
-    print("numerical: ", numerical_cols, "\n categorical: ", categorical_cols)

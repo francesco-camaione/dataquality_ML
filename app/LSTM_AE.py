@@ -176,9 +176,17 @@ def preprocess_data(spark, table_name_arg, timesteps_arg):
         inputCol="assembled_features", outputCol="features", withMean=True, withStd=True
     )
     pipeline_stages = indexers + imputer_stages + [assembler, scaler]
-    feature_pipeline = Pipeline(stages=pipeline_stages)
-    fitted_feature_pipeline = feature_pipeline.fit(df)
-    processed_df_features = fitted_feature_pipeline.transform(df)
+    pipeline = Pipeline(stages=pipeline_stages)
+    fitted_pipeline = pipeline.fit(df)
+
+    # Save the pipeline
+    pipeline_dir = "./pipelines/LSTM_AE_pipeline"
+    os.makedirs(pipeline_dir, exist_ok=True)
+    pipeline_path = os.path.join(pipeline_dir, f"pipeline_{table_name_arg}")
+    fitted_pipeline.save(pipeline_path)
+    print(f"Saved pipeline to: {pipeline_path}")
+
+    processed_df_features = fitted_pipeline.transform(df)
     print(
         f"Failure count after Spark ML pipeline (before UDF filter): {processed_df_features.where(col('failure') == 1).count()}"
     )
@@ -328,7 +336,7 @@ def load_or_create_model(
         print(f"Loading existing model from {full_model_path}")
         lstm_ae_model = load_model(full_model_path, compile=False)
         optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
-        lstm_ae_model.compile(optimizer=optimizer, loss="mse")
+        lstm_ae_model.compile(optimizer=optimizer, loss="mae")
         print("Model loaded and compiled successfully.")
     else:
         print("Defining and training a new model...")
@@ -359,12 +367,6 @@ def load_or_create_model(
         early_stopping = tf.keras.callbacks.EarlyStopping(
             monitor="val_loss", patience=3, restore_best_weights=True
         )
-        model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
-            full_model_path,
-            monitor="val_loss",
-            save_best_only=True,
-            save_format="keras",
-        )
         history = lstm_ae_model.fit(
             X_train_arg,
             X_train_arg,
@@ -372,8 +374,10 @@ def load_or_create_model(
             batch_size=32,
             validation_split=0.2,
             shuffle=True,
-            callbacks=[early_stopping, model_checkpoint],
+            callbacks=[early_stopping],
         )
+        # Save the trained model
+        lstm_ae_model.save(full_model_path)
         print(f"New model saved to {full_model_path}")
     return lstm_ae_model
 
@@ -520,6 +524,8 @@ def main():
     n_features_main = X_train_main.shape[2]
     model_path_main = os.path.join("./ml_models", f"LSTM_AE_{table_name_main}.keras")
 
+    # Check if model was loaded or newly trained
+    model_was_loaded = os.path.exists(model_path_main)
     lstm_ae_main = load_or_create_model(
         model_path_main, timesteps_main, n_features_main, X_train_main, table_name_main
     )
@@ -542,6 +548,17 @@ def main():
         print(
             f"\nAnomaly Threshold (95th percentile of normal data): {threshold_main:.4f}"
         )
+
+        # write threshold if model is newly trained
+        if not model_was_loaded:
+            thresholds_dir = "./dataset/thresholds"
+            os.makedirs(thresholds_dir, exist_ok=True)
+            threshold_file = os.path.join(
+                thresholds_dir, f"LSTM_AE_threshold_{table_name_main}.txt"
+            )
+            with open(threshold_file, "w") as f:
+                f.write(f"{threshold_main:.4f}")
+            print(f"Threshold saved to: {threshold_file}")
 
     generate_anomaly_report(
         reconstruction_errors_normal_main,
