@@ -137,9 +137,10 @@ def plot_roc_curve(all_true_labels_arg, all_reconstruction_errors_arg, table_nam
         plt.grid(True)
 
         roc_plot_path = os.path.join(
-            plots_dir, f"ROC_Curve_LSTM_AE_{table_name_arg}.png"
+            plots_dir, f"ROC_Curve_AE_{table_name_arg}.png"
         )
         plt.savefig(roc_plot_path)
         plt.close()
         print(f"ROC curve saved to {roc_plot_path}")
+    return
 
