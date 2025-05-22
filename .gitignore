@@ -3,6 +3,7 @@ app/prova.py
 spark-warehouse/
 dataset/2024_12_backblaze.csv
 dataset/2024_12_bb_3d.csv
+dataset/2024_12_15_test.csv
 TODO.txt
 
 # Environment variables
