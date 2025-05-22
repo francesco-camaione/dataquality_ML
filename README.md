@@ -8,7 +8,7 @@ Models have been tested using data of 2024-12-15.
 
 ## Model Performance
 
-### Latest Test Results using 2024-12-15
+### Latest Test Results using data of 2024-12-15
 
 #### LSTM Autoencoder Performance
 - **Detection Rate**: 100% (7/7 failure sequences detected)
