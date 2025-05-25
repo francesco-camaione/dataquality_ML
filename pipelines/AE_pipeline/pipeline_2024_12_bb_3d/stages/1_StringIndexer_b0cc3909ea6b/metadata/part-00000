@@ -1,1 +1,0 @@
-{"class":"org.apache.spark.ml.feature.StringIndexerModel","timestamp":1747915187594,"sparkVersion":"3.5.5","uid":"StringIndexer_b0cc3909ea6b","paramMap":{"outputCol":"serial_number_idx","inputCol":"serial_number","handleInvalid":"keep"},"defaultParamMap":{"outputCol":"StringIndexer_b0cc3909ea6b__output","handleInvalid":"error","stringOrderType":"frequencyDesc"}}
