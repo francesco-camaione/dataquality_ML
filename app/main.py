@@ -1,72 +1,24 @@
-from pyspark.sql import SparkSession
-import os
+from lib.connector import SparkToAWS
 
-# AWS Configuration
-AWS_REGION = "eu-west-1"
-AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
-AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")
-S3_WAREHOUSE = os.environ.get("S3_WAREHOUSE")
-GLUE_CATALOG_ID = os.environ.get("GLUE_CATALOG_ID")
 
-spark = (
-    SparkSession.builder.appName("DQ App")
-    .config("spark.driver.host", "127.0.0.1")
-    .config(
-        "spark.jars.packages",
-        "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.8.1,"
-        "org.apache.iceberg:iceberg-aws-bundle:1.8.1,"
-        "org.apache.hadoop:hadoop-aws:3.3.4,"
-        "software.amazon.awssdk:url-connection-client:2.20.160",
-    )
-    .config(
-        "spark.jars.repositories",
-        "https://repo1.maven.org/maven2/,https://repos.spark-packages.org/,https://repo.maven.apache.org/maven2/",
-    )
-    .config(
-        "spark.sql.catalog.s3tablescatalog", "org.apache.iceberg.spark.SparkCatalog"
-    )
-    .config(
-        "spark.sql.extensions",
-        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-    )
-    .config("spark.sql.catalog.s3tablescatalog.glueRegion", AWS_REGION)
-    .config("spark.sql.catalog.s3tablescatalog.glue.catalog-id", GLUE_CATALOG_ID)
-    .config("spark.sql.catalog.s3tablescatalog.type", "glue")
-    .config("spark.sql.catalog.s3tablescatalog.warehouse", S3_WAREHOUSE)
-    .config(
-        "spark.sql.catalog.s3tablescatalog.io-impl",
-        "org.apache.iceberg.aws.s3.S3FileIO",
-    )
-    .config(
-        "spark.hadoop.fs.s3a.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-    )
-    .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY)
-    .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_KEY)
-    .config("spark.hadoop.fs.s3a.endpoint", f"s3.{AWS_REGION}.amazonaws.com")
-    .config(
-        "spark.sql.extensions",
-        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-    )
-    .config(
-        "spark.hadoop.fs.s3a.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-    )
-    .getOrCreate()
-)
+connector = SparkToAWS()
+spark_session = connector.create_spark_session()
 
 print("Spark is running...")
 
-# spark.sql("""
-#     CREATE OR REPLACE TABLE s3tablescatalog.dq_db.unpivoted_datacenter_data
-#     USING iceberg
-#     LOCATION 's3a://dq-monitoring-bucket/iceberg/'
-#     AS SELECT *
-#     FROM parquet.`s3a://dq-monitoring-bucket/raw_data/unpivoted_data.parquet`;
-# """).show()
+# df = spark_session.read.option("header", "true").option("inferSchema", "true").csv("s3a://dq-monitoring-bucket/raw_data/2024_12_15_test.csv")
+# df.writeTo("s3tablescatalog.dq_db.2024_12_15_test").using("iceberg").createOrReplace()
 
-spark.sql(
-    "SELECT count(*) as tot FROM s3tablescatalog.dq_db.unpivoted_datacenter_data;"
+spark_session.sql(
+    """
+       SELECT *
+       FROM s3tablescatalog.dq_db.2024_12_bb_3d
+       LIMIT 10;
+   """
 ).show()
 
+# purge when dropping the table to remove the orphan metadata files
+# spark_session.sql(f"""DROP TABLE s3tablescatalog.dq_db.{table_name} PURGE;""").show()
+
+connector.close_spark_session()
 print("Spark is done!!")

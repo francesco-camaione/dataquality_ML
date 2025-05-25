@@ -5,7 +5,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
 
 from pyspark.sql import SparkSession, functions, types
-from pyspark.ml import Pipeline
+from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
 import keras
 import numpy as np
@@ -85,7 +85,27 @@ scaler = StandardScaler(
 )
 
 pipeline = Pipeline(stages=[imputer] + indexers + [assembler, scaler])
-fitted_pipeline = pipeline.fit(df_norm)
+
+# Load or create pipeline
+pipeline_path = f"./pipelines/AE_pipeline/pipeline_{table_name}"
+try:
+    if os.path.exists(pipeline_path):
+        print(f"Loading existing pipeline from {pipeline_path}")
+        fitted_pipeline = PipelineModel.load(pipeline_path)
+    else:
+        print(f"Pipeline not found at {pipeline_path}, building new pipeline...")
+        os.makedirs("./pipelines/AE_pipeline", exist_ok=True)
+        fitted_pipeline = pipeline.fit(df_norm)
+        # Save the pipeline
+        fitted_pipeline.write().overwrite().save(pipeline_path)
+        print(f"Saved pipeline to {pipeline_path}")
+except Exception as e:
+    print(f"Error with pipeline: {str(e)}")
+    print("Building new pipeline...")
+    fitted_pipeline = pipeline.fit(df_norm)
+    # Save the pipeline
+    fitted_pipeline.write().overwrite().save(pipeline_path)
+    print(f"Saved pipeline to {pipeline_path}")
 
 print("Transforming normal data...")
 proc_norm_df = fitted_pipeline.transform(df_norm)
@@ -242,7 +262,7 @@ anomaly_table.to_csv(f"./dataset/anomalies/anomalies_{table_name}.csv")
 
 # Model statistics and ROC curve
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc, confusion_matrix, accuracy_score
+from sklearn.metrics import roc_curve, auc, confusion_matrix
 
 # 1. Get reconstruction errors for the training (normal) data
 reconstructed_train = autoencoder.predict(X_train)
@@ -277,9 +297,6 @@ plt.grid(True)
 plt.savefig(f"./plots/ROC_Curve_AE_{table_name}.png")
 print(f"ROC curve plot saved to: /plots/ROC_Curve_AE_{table_name}.png")
 
-# 5. Calculate and print Confusion Matrix and Classification Report
-# Using the threshold based on normal data distribution
-# Predictions for normal data using this threshold
 predictions_on_normal_data = mae_train_normal > threshold
 
 all_predictions = np.concatenate([predictions_on_normal_data, anomalies])
@@ -288,167 +305,3 @@ print("Confusion Matrix (Threshold: {:.4f}):".format(threshold))
 
 cm = confusion_matrix(y_true, all_predictions)
 print(cm)
-
-
-# --- Function to test model on a new dataset ---
-def test_model_on_new_dataset(
-    spark_session,
-    pipeline_model,
-    trained_ae_model,
-    anomaly_threshold,
-    test_table_name_str,
-):
-    print(f"\n\n--- Testing with new dataset: {test_table_name_str}.csv ---")
-
-    new_test_raw_df = (
-        spark_session.read.option("header", "true")
-        .csv(f"./dataset/{test_table_name_str}.csv", inferSchema=True)
-        .repartition(32)
-    )
-    print(
-        f"New test df ({test_table_name_str}.csv) has {new_test_raw_df.count()} records"
-    )
-
-    if "failure" not in new_test_raw_df.columns:
-        print(
-            f"Error: The new test dataset {test_table_name_str}.csv must contain a 'failure' column for evaluation. Skipping."
-        )
-        return
-
-    # Accessing boolean_columns, functions, types from the global scope of the script
-    new_boolean_cols = boolean_columns(new_test_raw_df.schema)
-    if new_boolean_cols:
-        for column in new_boolean_cols:
-            new_test_raw_df = new_test_raw_df.withColumn(
-                column, functions.col(column).cast(types.IntegerType())
-            )
-
-    print(
-        f"Transforming new test data ({test_table_name_str}.csv) using the existing fitted pipeline..."
-    )
-    proc_new_test_df = pipeline_model.transform(new_test_raw_df)
-
-    print(f"Converting new test data ({test_table_name_str}.csv) to numpy arrays...")
-    collected_rows_for_numpy = proc_new_test_df.select("features", "failure").collect()
-
-    if not collected_rows_for_numpy:
-        print(
-            f"Warning: No data in proc_new_test_df for {test_table_name_str}.csv after transformation. Skipping evaluation."
-        )
-        if "new_test_raw_df" in locals() and new_test_raw_df is not None:
-            new_test_raw_df.unpersist()
-        if "proc_new_test_df" in locals() and proc_new_test_df is not None:
-            proc_new_test_df.unpersist()
-        return
-
-    # Accessing np from the global scope
-    new_test_features_list = [
-        row.features.toArray() for row in collected_rows_for_numpy
-    ]
-    X_new_test = np.array(new_test_features_list).astype(np.float32)
-    y_true_new = np.array([row.failure for row in collected_rows_for_numpy]).astype(int)
-
-    if X_new_test.ndim == 1:
-        X_new_test = X_new_test.reshape(1, -1)
-
-    if len(X_new_test) == 0:
-        print(
-            f"Warning: X_new_test is empty for {test_table_name_str}.csv. Skipping further evaluation."
-        )
-        if "new_test_raw_df" in locals() and new_test_raw_df is not None:
-            new_test_raw_df.unpersist()
-        if "proc_new_test_df" in locals() and proc_new_test_df is not None:
-            proc_new_test_df.unpersist()
-        return
-
-    print(f"Predicting on new test data ({test_table_name_str}.csv)...")
-    # Accessing mae_error_ae from the global scope
-    reconstructed_new_test = trained_ae_model.predict(X_new_test)
-    mae_new_test = mae_error_ae(X_new_test, reconstructed_new_test)
-
-    predictions_new_test = mae_new_test > anomaly_threshold
-
-    print(f"\n--- Evaluation Results for {test_table_name_str}.csv ---")
-    print(f"Using Anomaly threshold: {anomaly_threshold:.4f}")
-
-    actual_positives_new = np.sum(y_true_new)
-    actual_negatives_new = len(y_true_new) - actual_positives_new
-    print(f"Actual normal records in {test_table_name_str}.csv: {actual_negatives_new}")
-    print(
-        f"Actual failure records in {test_table_name_str}.csv: {actual_positives_new}"
-    )
-
-    predicted_anomalies_new = np.sum(predictions_new_test)
-    print(
-        f"Total records flagged as anomalies by model in {test_table_name_str}.csv: {predicted_anomalies_new}"
-    )
-
-    # Accessing confusion_matrix, accuracy_score from sklearn.metrics (imported globally)
-    cm_new = confusion_matrix(y_true_new, predictions_new_test, labels=[0, 1])
-
-    # Ensure cm_new.ravel() provides 4 values, otherwise handle potential error for datasets with only one class
-    if cm_new.size == 4:
-        tn_new, fp_new, fn_new, tp_new = cm_new.ravel()
-    elif (
-        cm_new.size == 1 and len(y_true_new) > 0
-    ):  # Only one class predicted and present
-        if y_true_new[0] == 0 and predictions_new_test[0] == 0:  # All are TN
-            tn_new, fp_new, fn_new, tp_new = cm_new.item(), 0, 0, 0
-        elif y_true_new[0] == 1 and predictions_new_test[0] == 1:  # All are TP
-            tn_new, fp_new, fn_new, tp_new = 0, 0, 0, cm_new.item()
-        elif y_true_new[0] == 0 and predictions_new_test[0] == 1:  # All are FP
-            tn_new, fp_new, fn_new, tp_new = 0, cm_new.item(), 0, 0
-        elif y_true_new[0] == 1 and predictions_new_test[0] == 0:  # All are FN
-            tn_new, fp_new, fn_new, tp_new = 0, 0, cm_new.item(), 0
-        else:  # Should not happen
-            tn_new, fp_new, fn_new, tp_new = 0, 0, 0, 0
-    else:  # Default to zeros if confusion matrix is not 2x2 (e.g. no samples in a class)
-        print(
-            "Warning: Confusion matrix is not 2x2. Metrics might be affected if classes are missing."
-        )
-        tn_new, fp_new, fn_new, tp_new = 0, 0, 0, 0  # default values
-
-    print("\nConfusion Matrix (New Test Set):")
-    print(f"Predicted:    Normal(0) Failure(1)")
-    print(f"Actual Normal(0): {tn_new:6d} {fp_new:8d}")
-    print(f"Actual Failure(1):{fn_new:6d} {tp_new:8d}")
-
-    print(f"\nDetailed Metrics (New Test Set - {test_table_name_str}.csv):")
-    print(f"True Positives (Failures correctly flagged as Failure): {tp_new}")
-    print(f"False Positives (Normals incorrectly flagged as Failure): {fp_new}")
-    print(f"True Negatives (Normals correctly flagged as Normal): {tn_new}")
-    print(f"False Negatives (Failures incorrectly flagged as Normal): {fn_new}")
-
-    accuracy_new = accuracy_score(y_true_new, predictions_new_test)
-    print(f"\nAccuracy: {accuracy_new:.4f}")
-
-    precision_failure = tp_new / (tp_new + fp_new) if (tp_new + fp_new) > 0 else 0
-    recall_failure = tp_new / (tp_new + fn_new) if (tp_new + fn_new) > 0 else 0
-    f1_failure = (
-        2 * (precision_failure * recall_failure) / (precision_failure + recall_failure)
-        if (precision_failure + recall_failure) > 0
-        else 0
-    )
-
-    print(f"\nMetrics for 'Failure' class (1) in {test_table_name_str}.csv:")
-    print(f"  Precision: {precision_failure:.4f} (TP / (TP + FP))")
-    print(f"  Recall (Sensitivity): {recall_failure:.4f} (TP / (TP + FN))")
-    print(f"  F1-score: {f1_failure:.4f}")
-
-    specificity_normal = tn_new / (tn_new + fp_new) if (tn_new + fp_new) > 0 else 0
-    print(f"\nMetrics for 'Normal' class (0) in {test_table_name_str}.csv:")
-    print(f"  Specificity: {specificity_normal:.4f} (TN / (TN + FP))")
-
-
-# --- Test with 2024_12_15_bb_3d dataset ---
-new_test_table_name_param = "2024_12_15_test"
-test_model_on_new_dataset(
-    spark_session=spark,
-    pipeline_model=fitted_pipeline,
-    trained_ae_model=autoencoder,
-    anomaly_threshold=threshold,
-    test_table_name_str=new_test_table_name_param,
-)
-
-
-spark.stop()
