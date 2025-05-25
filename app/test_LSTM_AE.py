@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -10,7 +11,7 @@ from pyspark.sql import SparkSession
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
 from keras.models import load_model
-from pyspark.sql.functions import col, count, when, stddev_pop, udf
+from pyspark.sql.functions import col, count, when, stddev_pop, udf, lit
 from pyspark.sql.types import NumericType, BooleanType
 from lib.utils import (
     create_sequences,
@@ -19,6 +20,89 @@ from lib.utils import (
     plot_roc_curve,
     boolean_columns,
 )
+
+
+def build_pipeline(spark, train_df, categorical_cols, numerical_cols, boolean_cols):
+    """
+    Builds and fits a preprocessing pipeline for the LSTM Autoencoder.
+    """
+    # Identify numerical columns that are entirely null or NaN in training data
+    problematic_numerical_cols = []
+    for col_name in numerical_cols:
+        if train_df.where(col(col_name).isNotNull()).count() == 0:
+            problematic_numerical_cols.append(col_name)
+            print(
+                f"Warning: Numerical column '{col_name}' contains only null/NaN values in training data and will be excluded from imputation and features."
+            )
+
+    valid_numerical_cols = [
+        c for c in numerical_cols if c not in problematic_numerical_cols
+    ]
+
+    # Process data in a single pipeline to minimize memory usage
+    print("Building and fitting pipeline...")
+
+    # Handle categorical columns - only use columns that exist in both datasets
+    indexers = []
+    valid_categorical_cols = []
+    for c in categorical_cols:
+        if c in train_df.columns:
+            # Check if the column has any non-null values
+            if train_df.where(col(c).isNotNull()).count() > 0:
+                indexers.append(
+                    StringIndexer(
+                        inputCol=c, outputCol=c + "_idx", handleInvalid="keep"
+                    )
+                )
+                valid_categorical_cols.append(c)
+            else:
+                print(
+                    f"Warning: Categorical column '{c}' contains only null values in training data, skipping..."
+                )
+        else:
+            print(
+                f"Warning: Categorical column '{c}' not found in training data, skipping..."
+            )
+
+    # Handle numerical columns with imputation
+    imputer = Imputer(
+        inputCols=valid_numerical_cols, outputCols=valid_numerical_cols, strategy="mean"
+    )
+
+    # Combine all features - only use columns that exist
+    feature_cols = []
+    for c in valid_categorical_cols:
+        feature_cols.append(c + "_idx")
+    feature_cols.extend(valid_numerical_cols)
+    feature_cols.extend(boolean_cols)
+
+    # Assemble features with proper handling of invalid values
+    assembler = VectorAssembler(
+        inputCols=feature_cols, outputCol="assembled_features", handleInvalid="keep"
+    )
+
+    # Scale features with robust scaling
+    scaler = StandardScaler(
+        inputCol="assembled_features", outputCol="features", withMean=True, withStd=True
+    )
+
+    # Create and fit pipeline
+    pipeline = Pipeline(stages=[imputer] + indexers + [assembler, scaler])
+    fitted_pipeline = pipeline.fit(train_df)
+
+    # Print feature information
+    print("\nFeature Information:")
+    print(f"Number of categorical features: {len(valid_categorical_cols)}")
+    print(f"Number of numerical features: {len(valid_numerical_cols)}")
+    print(f"Number of boolean features: {len(boolean_cols)}")
+    print(f"Total features after processing: {len(feature_cols)}")
+
+    return (
+        fitted_pipeline,
+        valid_categorical_cols,
+        valid_numerical_cols,
+        boolean_cols,
+    )
 
 
 def test_lstm_ae_model(test_table_name, train_table_name="2024_12_bb_3d", timesteps=20):
@@ -68,14 +152,36 @@ def test_lstm_ae_model(test_table_name, train_table_name="2024_12_bb_3d", timest
     print(f"Number of normal records: {df_normal.count()}")
     print(f"Number of failure records: {df_failure.count()}")
 
-    # Load the training pipeline
-    pipeline_path = f"./pipelines/LSTM_AE_pipeline/pipeline_2024_12_bb_3d"
-    if not os.path.exists(pipeline_path):
-        print(f"Error: Pipeline not found at {pipeline_path}")
-        return
+    # Load training data to build pipeline
+    print("Loading training data to build pipeline...")
+    train_df = spark.read.option("header", "true").csv(
+        f"./dataset/{train_table_name}.csv",
+        inferSchema=True,
+    )
 
-    fitted_pipeline = PipelineModel.load(pipeline_path)
-    print("Loaded training pipeline successfully")
+    # Convert boolean columns to numeric type in training data
+    boolean_cols = boolean_columns(train_df.schema)
+    if boolean_cols:
+        print(f"Converting boolean columns to numeric in training data: {boolean_cols}")
+        for column in boolean_cols:
+            train_df = train_df.withColumn(column, col(column).cast("integer"))
+
+    # Infer schema & build feature pipeline using training data
+    categorical_cols, numerical_cols = infer_column_types_from_schema(train_df.schema)
+
+    # Build and fit the pipeline
+    fitted_pipeline, categorical_cols, numerical_cols, boolean_cols = build_pipeline(
+        spark, train_df, categorical_cols, numerical_cols, boolean_cols
+    )
+
+    # Ensure test data has all required columns
+    missing_cols = set(categorical_cols + numerical_cols + boolean_cols) - set(
+        df.columns
+    )
+    if missing_cols:
+        print(f"Adding missing columns to test data: {missing_cols}")
+        for col_name in missing_cols:
+            df = df.withColumn(col_name, lit(0))
 
     # Transform both normal and failure data using the training pipeline
     processed_normal = fitted_pipeline.transform(df_normal)
@@ -159,6 +265,39 @@ def test_lstm_ae_model(test_table_name, train_table_name="2024_12_bb_3d", timest
     print(f"\nMaking predictions...")
     print(f"X_normal_sequences shape: {X_normal_sequences.shape}")
     print(f"X_failure_sequences shape: {X_failure_sequences.shape}")
+
+    # Ensure input shape matches model's expected shape
+    expected_features = 127  # This should match the model's input shape
+    if X_normal_sequences.shape[2] != expected_features:
+        print(
+            f"Warning: Input shape mismatch. Expected {expected_features} features, got {X_normal_sequences.shape[2]}"
+        )
+        print("Truncating or padding features to match expected shape...")
+        if X_normal_sequences.shape[2] > expected_features:
+            X_normal_sequences = X_normal_sequences[:, :, :expected_features]
+            if len(X_failure_sequences) > 0:
+                X_failure_sequences = X_failure_sequences[:, :, :expected_features]
+        else:
+            # Pad with zeros if we have fewer features
+            padding = np.zeros(
+                (
+                    X_normal_sequences.shape[0],
+                    X_normal_sequences.shape[1],
+                    expected_features - X_normal_sequences.shape[2],
+                )
+            )
+            X_normal_sequences = np.concatenate([X_normal_sequences, padding], axis=2)
+            if len(X_failure_sequences) > 0:
+                padding = np.zeros(
+                    (
+                        X_failure_sequences.shape[0],
+                        X_failure_sequences.shape[1],
+                        expected_features - X_failure_sequences.shape[2],
+                    )
+                )
+                X_failure_sequences = np.concatenate(
+                    [X_failure_sequences, padding], axis=2
+                )
 
     reconstructed_normal = lstm_ae_model.predict(X_normal_sequences)
     print(f"Reconstructed normal shape: {reconstructed_normal.shape}")
