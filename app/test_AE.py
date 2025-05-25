@@ -97,9 +97,16 @@ def test_ae_model(test_table_name, train_table_name="2024_12_bb_3d"):
     print(f"Number of failure records: {df_failure.count()}")
 
     # Load or create the training pipeline
-    pipeline_path = f"./pipelines/AE_pipeline/pipeline_{train_table_name}"
-    if not os.path.exists(pipeline_path):
-        print(f"Pipeline not found at {pipeline_path}, building new pipeline...")
+    pipeline_path = f"./pipelines/AE_pipeline/test_pipeline_{train_table_name}"
+    try:
+        if os.path.exists(pipeline_path):
+            print(f"Loading existing pipeline from {pipeline_path}")
+            fitted_pipeline = PipelineModel.load(pipeline_path)
+        else:
+            raise FileNotFoundError(f"Pipeline not found at {pipeline_path}")
+    except Exception as e:
+        print(f"Error loading pipeline: {str(e)}")
+        print("Rebuilding pipeline...")
         # Create pipeline directory if it doesn't exist
         os.makedirs("./pipelines/AE_pipeline", exist_ok=True)
 
@@ -128,21 +135,31 @@ def test_ae_model(test_table_name, train_table_name="2024_12_bb_3d"):
 
         # Process data in a single pipeline to minimize memory usage
         print("Building and fitting pipeline...")
+
+        # Handle categorical columns
         indexers = [
             StringIndexer(inputCol=c, outputCol=c + "_idx", handleInvalid="keep")
             for c in categorical_cols
         ]
+
+        # Handle numerical columns with imputation
         imputer = Imputer(
             inputCols=valid_numerical_cols,
             outputCols=valid_numerical_cols,
             strategy="mean",
         )
+
+        # Combine all features
         feature_cols = (
             [c + "_idx" for c in categorical_cols] + valid_numerical_cols + boolean_cols
         )
+
+        # Assemble features with proper handling of invalid values
         assembler = VectorAssembler(
             inputCols=feature_cols, outputCol="assembled_features", handleInvalid="keep"
         )
+
+        # Scale features with robust scaling
         scaler = StandardScaler(
             inputCol="assembled_features",
             outputCol="features",
@@ -150,15 +167,16 @@ def test_ae_model(test_table_name, train_table_name="2024_12_bb_3d"):
             withStd=True,
         )
 
+        # Create and fit pipeline
         pipeline = Pipeline(stages=[imputer] + indexers + [assembler, scaler])
         fitted_pipeline = pipeline.fit(train_df)
 
-        # Save the pipeline
-        fitted_pipeline.save(pipeline_path)
-        print(f"Saved pipeline to {pipeline_path}")
-    else:
-        print(f"Loading existing pipeline from {pipeline_path}")
-        fitted_pipeline = PipelineModel.load(pipeline_path)
+        # Print feature information
+        print("\nFeature Information:")
+        print(f"Number of categorical features: {len(categorical_cols)}")
+        print(f"Number of numerical features: {len(valid_numerical_cols)}")
+        print(f"Number of boolean features: {len(boolean_cols)}")
+        print(f"Total features after processing: {len(feature_cols)}")
 
     # Transform both normal and failure data using the training pipeline
     processed_normal = fitted_pipeline.transform(df_normal)

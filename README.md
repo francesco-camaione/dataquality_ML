@@ -22,6 +22,10 @@ Models have been tested using data of 2024-12-15.
 #### Autoencoder Performance
 - **Detection Rate**: 100% (7/7 failure records detected)
 - **False Positive Rate**: 1% (3,013 false positives out of 301,286 normal records)
+- AE layers with decreasing dimensions (512 → 256 → 128 → 64 -> 128 -> 256 -> 512)
+- Training completed in 50 epochs
+
+
 
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE.txt) file for details.
