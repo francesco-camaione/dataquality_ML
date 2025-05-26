@@ -348,12 +348,6 @@ def test_ae_model(test_table_name, train_table_name="2024_12_bb_3d"):
         print("\nSaving anomaly records...")
         anomaly_df = pd.DataFrame(anomaly_records)
 
-        # Add additional metadata columns
-        anomaly_df["threshold"] = threshold
-        anomaly_df["error_to_threshold_ratio"] = (
-            anomaly_df["reconstruction_error"] / threshold
-        )
-
         # Sort by reconstruction error in descending order
         anomaly_df = anomaly_df.sort_values("reconstruction_error", ascending=False)
 

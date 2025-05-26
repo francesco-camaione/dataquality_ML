@@ -45,18 +45,33 @@ def ms_error_ae(test_data, reconstructed_data):
 
 
 def mae_error_ae(test_data, reconstructed_data):
+    """
+    Calculate normalized Mean Absolute Error (MAE) between original and reconstructed data.
+    Errors are normalized by feature variance to prevent features with higher variability
+    from dominating the error calculation.
+
+    Parameters:
+        test_data: Original data array
+        reconstructed_data: Reconstructed data array
+
+    Returns:
+        Per-record reconstruction errors, normalized by feature variance
+    """
     # Calculate variance for each feature
     feature_variances = np.var(test_data, axis=0)
+
     # Set a minimum variance threshold to avoid numerical instability
     min_variance = 1e-6
     feature_variances = np.maximum(feature_variances, min_variance)
-    # Calculate absolute errors
+
+    # Calculate absolute errors for each feature
     abs_errors = np.abs(test_data - reconstructed_data)
-    # Weight the errors by feature variances
-    weighted_errors = abs_errors / feature_variances
-    # Clip extreme values to avoid infinity
-    weighted_errors = np.clip(weighted_errors, 0, 1e6)
-    return np.mean(weighted_errors, axis=1)
+
+    # Normalize errors by feature variance
+    normalized_errors = abs_errors / feature_variances
+
+    # Calculate per-record mean normalized error
+    return np.mean(normalized_errors, axis=1)
 
 
 def ms_error(test_data, reconstructed_data):

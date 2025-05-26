@@ -12,16 +12,16 @@ Models have been tested using data of 2024-12-15.
 
 #### LSTM Autoencoder Performance
 - **Detection Rate**: 100% (7/7 failure sequences detected)
-- **False Positive Rate**: 0% (0 false positives out of 301,267 normal sequences)
+- **False Positive Rate**: 0% (0 false positives out of 301267 normal sequences)
 - **Model Architecture**:
   - Input shape: (20, 127)
   - LSTM layers with decreasing dimensions (32 → 16 → 16 → 32)
-  - Total parameters: 36,191
+  - Total parameters: 36191
   - Training completed in 10 epochs with validation loss: 0.0843
 
 #### Autoencoder Performance
 - **Detection Rate**: 100% (7/7 failure records detected)
-- **False Positive Rate**: 1% (3,013 false positives out of 301,286 normal records)
+- **False Positive Rate**: 1.76% (5308 false positives out of 301286 normal records)
 - AE layers with decreasing dimensions (512 → 256 → 128 → 64 -> 128 -> 256 -> 512)
 - Training completed in 50 epochs
 
