@@ -2,6 +2,7 @@ import sys
 import os
 import tensorflow as tf
 
+
 tf.config.set_visible_devices([], "GPU")
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -14,6 +15,7 @@ from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, I
 from keras.models import Model, load_model
 from keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
 from keras.optimizers.legacy import Adam
+from lib.connector import SparkToAWS
 from lib.utils import (
     create_sequences,
     mae_error,
@@ -22,6 +24,38 @@ from lib.utils import (
 )
 from pyspark.sql.functions import col, count, when, stddev_pop, udf
 from pyspark.sql.types import NumericType, BooleanType
+
+
+def _validate_spark_vector_features(vector_input):
+    """
+    Checks if a PySpark Vector contains NaN or Inf values by direct iteration.
+    Intended for use as a UDF.
+    """
+    if vector_input is None:
+        return False
+    try:
+        # vector_input is expected to be a pyspark.ml.linalg.Vector
+        # Assign infinity values to local variables first
+        pos_inf = float("inf")
+        neg_inf = float("-inf")
+
+        for i in range(vector_input.size):
+            item = vector_input[i]
+            # Check for NaN (item != item is True only for NaN)
+            if item != item:
+                return False  # Found NaN
+             # Check for Inf using local variables
+            if item == pos_inf or item == neg_inf:
+                return False  # Found Inf
+        return True  # No NaN or Inf found
+    except (
+        AttributeError,
+        TypeError,
+        IndexError,
+    ):  # Common errors if input is not a valid Spark Vector
+        return False
+    except Exception:  # Catch-all for other unexpected issues
+        return False
 
 
 def preprocess_data(spark, table_name_arg, timesteps_arg):
@@ -159,13 +193,7 @@ def preprocess_data(spark, table_name_arg, timesteps_arg):
         c + "_idx" for c in categorical_cols
     ] + imputed_numerical_cols_final
 
-    def validate_features(vector):
-        if vector is None:
-            return False
-        arr = vector.toArray()
-        return not (np.isnan(arr).any() or np.isinf(arr).any())
-
-    validate_features_udf = udf(validate_features, BooleanType())
+    validate_features_udf = udf(_validate_spark_vector_features, BooleanType())
 
     assembler = VectorAssembler(
         inputCols=feature_cols_for_assembler,
@@ -183,7 +211,7 @@ def preprocess_data(spark, table_name_arg, timesteps_arg):
     pipeline_dir = "./pipelines/LSTM_AE_pipeline"
     os.makedirs(pipeline_dir, exist_ok=True)
     pipeline_path = os.path.join(pipeline_dir, f"pipeline_{table_name_arg}")
-    fitted_pipeline.save(pipeline_path)
+    fitted_pipeline.write().overwrite().save(pipeline_path)
     print(f"Saved pipeline to: {pipeline_path}")
 
     processed_df_features = fitted_pipeline.transform(df)
@@ -436,9 +464,10 @@ def generate_anomaly_report(
                         record = original_full_pdf_arg.iloc[
                             original_pdf_index
                         ].to_dict()
-                        # Normalize reconstruction error relative to threshold
-                        normalized_error = reconstruction_errors_failure_arg[sequence_idx] / threshold_arg
-                        record["reconstruction_error_sequence"] = normalized_error
+                        # Assign the reconstruction error of the sequence to each record from it
+                        record["reconstruction_error_sequence"] = (
+                            reconstruction_errors_failure_arg[sequence_idx]
+                        )
                         record["is_failure"] = (
                             True  # These records are from failure_data
                         )
@@ -494,14 +523,8 @@ def generate_anomaly_report(
 def main():
     table_name_main = "2024_12_bb_3d"
     timesteps_main = 20
-
-    spark_main = (
-        SparkSession.builder.appName("App")
-        .master("local[*]")
-        .config("spark.executor.memory", "4g")
-        .config("spark.driver.memory", "4g")
-        .getOrCreate()
-    )
+    connector = SparkToAWS()
+    spark_main = connector.create_local_spark_session()
 
     (
         original_full_pdf_main,
@@ -572,7 +595,7 @@ def main():
     plot_roc_curve(
         all_true_labels_main, all_reconstruction_errors_main, table_name_main
     )
-
+    connector.close_spark_session()
     print("Script finished.")
 
 
