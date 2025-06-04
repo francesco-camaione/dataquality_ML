@@ -20,8 +20,13 @@ Models have been tested using data of 2024-12-15.
   - Training completed in 10 epochs with validation loss: 0.0843
 
 #### Autoencoder Performance
-- **Detection Rate**: 100% (7/7 failure records detected)
-- **False Positive Rate**: 1.76% (5308 false positives out of 301286 normal records)
+- **Anomaly threshold**: 2739.8549
+- **Total normal records processed**: 301286
+- **Total failure records processed**: 7
+- **False positives (normal records flagged as anomaly)**: 56312
+- **True positives (failure records correctly flagged)**: 4
+- **False positive rate**: 18.69%
+- **Detection rate**: 57.14%
 - AE layers with decreasing dimensions (512 → 256 → 128 → 64 -> 128 -> 256 -> 512)
 - Training completed in 50 epochs
 
