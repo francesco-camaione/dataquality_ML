@@ -1,6 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from pyspark.sql.types import StructType, StringType, BooleanType, NumericType
+from pyspark.ml import Pipeline, PipelineModel
+from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
+from pyspark.sql.functions import col, isnan
 
 
 def boolean_columns(schema: StructType) -> list[str]:
@@ -33,17 +36,6 @@ def infer_column_types_from_schema(schema: StructType) -> tuple[list[str], list[
     return categorical_cols, numerical_cols
 
 
-def ms_error_ae(test_data, reconstructed_data):
-    # Calculate variance for each feature
-    feature_variances = np.var(test_data, axis=0)
-    # Avoid division by zero by replacing zero variances with 1
-    feature_variances = np.where(feature_variances == 0, 1, feature_variances)
-    # Calculate weighted MSE
-    squared_errors = np.power(test_data - reconstructed_data, 2)
-    weighted_errors = squared_errors / feature_variances
-    return np.mean(weighted_errors, axis=1)
-
-
 def mae_error_ae(test_data, reconstructed_data):
     """
     Calculate normalized Mean Absolute Error (MAE) between original and reconstructed data.
@@ -72,22 +64,6 @@ def mae_error_ae(test_data, reconstructed_data):
 
     # Calculate per-record mean normalized error
     return np.mean(normalized_errors, axis=1)
-
-
-def ms_error(test_data, reconstructed_data):
-    # Calculate variance for each feature across all timesteps and samples
-    feature_variances = np.var(test_data.reshape(-1, test_data.shape[-1]), axis=0)
-    # Set a minimum variance threshold to avoid numerical instability
-    min_variance = 1e-6
-    feature_variances = np.maximum(feature_variances, min_variance)
-    # Calculate squared errors
-    squared_errors = np.power(test_data - reconstructed_data, 2)
-    # Weight the errors by feature variances
-    weighted_errors = squared_errors / feature_variances
-    # Clip extreme values to avoid infinity
-    weighted_errors = np.clip(weighted_errors, 0, 1e6)
-    # Average across both timesteps and features
-    return np.mean(weighted_errors, axis=(1, 2))
 
 
 def mae_error(test_data, reconstructed_data):
@@ -156,3 +132,119 @@ def plot_roc_curve(all_true_labels_arg, all_reconstruction_errors_arg, table_nam
         plt.close()
         print(f"ROC curve saved to {roc_plot_path}")
     return
+
+
+def build_and_fit_feature_pipeline(df_for_fitting, all_boolean_column_names_as_int):
+    """
+    Builds and fits the standard feature engineering pipeline.
+    Assumes boolean columns have already been identified and cast to integer in df_for_fitting.
+
+    Args:
+        df_for_fitting (DataFrame): Spark DataFrame to fit the pipeline on
+                                    (e.g., normal data only for training an AE).
+        all_boolean_column_names_as_int (list): List of column names that were
+                                              originally boolean and are now integer type
+                                              in df_for_fitting.
+
+    Returns:
+        tuple: (fitted_pipeline: PipelineModel,
+                feature_cols_for_assembler: list)
+    """
+    print(
+        f"Building and fitting pipeline on DataFrame with {df_for_fitting.count()} records."
+    )
+
+    # Infer categorical and numerical types.
+    # Note: infer_column_types_from_schema might classify integer-cast booleans as numerical.
+    # We will handle this by ensuring boolean columns are treated distinctly.
+    categorical_cols_inferred, numerical_cols_inferred = infer_column_types_from_schema(
+        df_for_fitting.schema
+    )
+
+    # Exclude known boolean columns (now int) from the inferred numerical list
+    # to avoid double-counting or mis-typing them in the imputer.
+    numerical_cols_for_imputer = [
+        c for c in numerical_cols_inferred if c not in all_boolean_column_names_as_int
+    ]
+
+    problematic_numerical_cols = []
+    for col_name in numerical_cols_for_imputer:
+        if (
+            df_for_fitting.where(
+                col(col_name).isNotNull() & ~isnan(col(col_name))
+            ).count()
+            == 0
+        ):
+            problematic_numerical_cols.append(col_name)
+            print(
+                f"Warning: Numerical column '{col_name}' contains only null/NaN values "
+                f"in the provided DataFrame and will be excluded from imputation and features."
+            )
+
+    valid_numerical_cols_for_imputer = [
+        c for c in numerical_cols_for_imputer if c not in problematic_numerical_cols
+    ]
+
+    indexers = [
+        StringIndexer(inputCol=c, outputCol=c + "_idx", handleInvalid="keep")
+        for c in categorical_cols_inferred
+    ]
+    imputer = Imputer(
+        inputCols=valid_numerical_cols_for_imputer,
+        outputCols=valid_numerical_cols_for_imputer,
+        strategy="mean",
+    )
+
+    # Construct the list of features for the assembler
+    feature_cols_for_assembler_temp = (
+        [c + "_idx" for c in categorical_cols_inferred]
+        + valid_numerical_cols_for_imputer
+        + all_boolean_column_names_as_int  # These are already int type
+    )
+
+    # Remove duplicates, preserving order
+    seen = set()
+    feature_cols_for_assembler = [
+        x for x in feature_cols_for_assembler_temp if not (x in seen or seen.add(x))
+    ]
+
+    assembler = VectorAssembler(
+        inputCols=feature_cols_for_assembler,
+        outputCol="assembled_features",
+        handleInvalid="keep",
+    )
+    scaler = StandardScaler(
+        inputCol="assembled_features",
+        outputCol="features",
+        withMean=True,
+        withStd=True,
+    )
+
+    pipeline_stages = []
+    if (
+        valid_numerical_cols_for_imputer
+    ):  # Only add imputer if there are numerical cols to impute
+        pipeline_stages.append(imputer)
+    pipeline_stages.extend(indexers)
+    pipeline_stages.append(assembler)
+    pipeline_stages.append(scaler)
+
+    pipeline = Pipeline(stages=pipeline_stages)
+    fitted_pipeline = pipeline.fit(df_for_fitting)
+
+    print(
+        "\nFeature Information (from common utility function build_and_fit_feature_pipeline):"
+    )
+    print(
+        f"  Categorical features processed (after indexing): {len(categorical_cols_inferred)}"
+    )
+    print(
+        f"  Numerical features for imputer (valid): {len(valid_numerical_cols_for_imputer)}"
+    )
+    print(
+        f"  Boolean features (as integer input): {len(all_boolean_column_names_as_int)}"
+    )
+    print(f"  Total features for VectorAssembler: {len(feature_cols_for_assembler)}")
+    # print(f"  Feature columns for assembler: {feature_cols_for_assembler}") # Uncomment for debugging
+
+    return fitted_pipeline, feature_cols_for_assembler
