@@ -436,10 +436,9 @@ def generate_anomaly_report(
                         record = original_full_pdf_arg.iloc[
                             original_pdf_index
                         ].to_dict()
-                        # Assign the reconstruction error of the sequence to each record from it
-                        record["reconstruction_error_sequence"] = (
-                            reconstruction_errors_failure_arg[sequence_idx]
-                        )
+                        # Normalize reconstruction error relative to threshold
+                        normalized_error = reconstruction_errors_failure_arg[sequence_idx] / threshold_arg
+                        record["reconstruction_error_sequence"] = normalized_error
                         record["is_failure"] = (
                             True  # These records are from failure_data
                         )
