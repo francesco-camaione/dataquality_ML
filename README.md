@@ -1,10 +1,10 @@
 # Data Quality anomalies detection leveraging Machine Learning 
 
 ## Description
-This project implements Autoencoder (AE) models using PySpark and Keras for anomaly detection in a dataset stored in a Data Lakehouse. The goal is to preprocess the data stored as Iceberg tables on AWS S3 bucket (cataloged using Glue Catalog), train an AE or LSTM Autoencoder, and evaluate its performance in identifying anomalies based on reconstruction error (mean absolute error).
+This project implements Autoencoder (AE) models using PySpark and Keras for anomaly detection in a dataset stored in a Data Lakehouse. The goal is to preprocess the data stored as Iceberg tables on AWS S3 bucket (cataloged using Glue Catalog), train an Isolation Forest, AE and LSTM Autoencoder, and evaluate its performance in identifying anomalies based on reconstruction error (mean absolute error).
 The service could then be abstracted and used for several tables on a daily or weekly basis using orchestration tools.
-Data is downloaded from the https://www.backblaze.com/cloud-storage/resources/hard-drive-test-data, and the models are trained using the data (filtering failure == 0) related to the first 3 days of December 2024. The threshold of the reconstruction error after which records are considered anomalies is computed using the n percentile of the reconstruction error of the training data.
-Models have been tested using data of 2024-12-15.
+Data is downloaded from the https://www.backblaze.com/cloud-storage/resources/hard-drive-test-data, and the models are trained using the data related to the first 3 days of December 2024. The threshold of the reconstruction error after which records are considered anomalies is computed using the n percentile of the reconstruction error of the training data.
+Models have been tested using data of 2024-12-25.
 
 ## Model Performance
 
