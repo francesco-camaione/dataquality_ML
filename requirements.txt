@@ -1,4 +1,4 @@
-pyspark==3.3.0
+pyspark==3.4.0
 pyiceberg==0.5.1
 tensorflow==2.13.0
 tensorflow-macos==2.13.0

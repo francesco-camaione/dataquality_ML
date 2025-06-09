@@ -195,6 +195,16 @@ def test_ae_model(test_table_name, train_table_name="2024_12_bb_3d"):
             test_data_features, reconstructed_test_data
         )
 
+        # Print reconstruction error statistics
+        print("\nReconstruction Error Statistics:")
+        print(f"Mean error: {np.mean(all_reconstruction_errors):.4f}")
+        print(f"Median error: {np.median(all_reconstruction_errors):.4f}")
+        print(f"Standard deviation: {np.std(all_reconstruction_errors):.4f}")
+        print(f"Min error: {np.min(all_reconstruction_errors):.4f}")
+        print(f"Max error: {np.max(all_reconstruction_errors):.4f}")
+        print(f"25th percentile: {np.percentile(all_reconstruction_errors, 25):.4f}")
+        print(f"75th percentile: {np.percentile(all_reconstruction_errors, 75):.4f}")
+
         # --- Added for debugging reconstruction errors ---
         if len(original_labels) > 0 and len(all_reconstruction_errors) > 0:
             failure_indices = np.where(original_labels == 1)[0]
@@ -303,5 +313,5 @@ def test_ae_model(test_table_name, train_table_name="2024_12_bb_3d"):
 
 
 if __name__ == "__main__":
-    test_table_name_arg = "2024_12_15_test"
+    test_table_name_arg = "2024_12_25_test"
     test_ae_model(test_table_name_arg)

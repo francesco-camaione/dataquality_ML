@@ -8,29 +8,42 @@ Models have been tested using data of 2024-12-15.
 
 ## Model Performance
 
-### Latest Test Results using data of 2024-12-15
+### Latest Test Results using data of 2024-12-25
+
+#### Isolation Forest Performance
+- **Total normal records processed**: 219744
+- **Total failure records processed**: 4
+- **True Positives**: 3
+- **False Positives**: 21972
+- **Detection Rate**: 75.00%
+- **False Positive Rate**: 10%
+- Model parameters:
+  - n_estimators: 6000
+  - max_samples: 16
+  - contamination: 0.00025
+  - max_features: 0.2
+  - bootstrap: True
+- Threshold set at 90th percentile of anomaly scores
 
 #### LSTM Autoencoder Performance
-- **Detection Rate**: 100% (7/7 failure sequences detected)
-- **False Positive Rate**: 0% (0 false positives out of 301267 normal sequences)
-- **Model Architecture**:
-  - Input shape: (20, 127)
-  - LSTM layers with decreasing dimensions (32 → 16 → 16 → 32)
-  - Total parameters: 36191
-  - Training completed in 10 epochs with validation loss: 0.0843
+- Training completed in 100 epochs 
+- **Total normal records processed**: 219784
+- **Total failure records processed**: 4
+- **False positives (normal records flagged as anomaly)**: 116134
+- **True positives (failure records correctly flagged)**: 1
+- **Detection Rate**: 25% (1/4 failure sequences detected)
+- **False Positive Rate**: 53% (1 false positives)
+- LSTM layers with decreasing dimensions (128 → 64 → 32 → 64 → 128)
 
 #### Autoencoder Performance
-- **Anomaly threshold**: 2739.8549
-- **Total normal records processed**: 301286
-- **Total failure records processed**: 7
-- **False positives (normal records flagged as anomaly)**: 56312
-- **True positives (failure records correctly flagged)**: 4
-- **False positive rate**: 18.69%
-- **Detection rate**: 57.14%
-- AE layers with decreasing dimensions (512 → 256 → 128 → 64 -> 128 -> 256 -> 512)
-- Training completed in 50 epochs
-
-
+- Training completed in ~50 epochs
+- **Total normal records processed**: 219784
+- **Total failure records processed**: 4
+- **False positives (normal records flagged as anomaly)**: 75834
+- **True positives (failure records correctly flagged)**: 1
+- **False positive rate**: 34.51%
+- **Detection rate**: 25.00%
+- AE layers with decreasing dimensions (512 → 256 → 128 → 48 -> 128 -> 256 -> 512)
 
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE.txt) file for details.
