@@ -1,7 +1,8 @@
 import sys
 import os
 import tensorflow as tf
-
+import json
+import gc
 
 tf.config.set_visible_devices([], "GPU")
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -9,417 +10,361 @@ sys.path.append(project_root)
 
 import numpy as np
 import pandas as pd
-from pyspark.sql import SparkSession
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
+from pyspark.ml.feature import VectorAssembler, StandardScaler, Imputer
 from keras.models import Model, load_model
-from keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
+from keras.layers import (
+    Input,
+    LSTM,
+    GRU,
+    RepeatVector,
+    TimeDistributed,
+    Dense,
+    Dropout,
+    BatchNormalization,
+    Bidirectional,
+)
 from keras.optimizers.legacy import Adam
+from keras.regularizers import l2
 from lib.connector import SparkToAWS
 from lib.utils import (
     create_sequences,
     mae_error,
-    infer_column_types_from_schema,
     plot_roc_curve,
+    plot_reconstruction_error,
 )
-from pyspark.sql.functions import col, count, when, stddev_pop, udf
-from pyspark.sql.types import NumericType, BooleanType
+from pyspark.sql.functions import col
+from pyspark.sql.types import NumericType
+from pyspark.sql.functions import isnan
 
 
-def _validate_spark_vector_features(vector_input):
+def preprocess_data(spark, train_table_name_arg, test_table_name_arg, timesteps_arg):
     """
-    Checks if a PySpark Vector contains NaN or Inf values by direct iteration.
-    Intended for use as a UDF.
+    Loads, preprocesses both training and test data.
+    Fits preprocessing pipeline on training data and applies it to both datasets.
     """
-    if vector_input is None:
-        return False
-    try:
-        # vector_input is expected to be a pyspark.ml.linalg.Vector
-        # Assign infinity values to local variables first
-        pos_inf = float("inf")
-        neg_inf = float("-inf")
-
-        for i in range(vector_input.size):
-            item = vector_input[i]
-            # Check for NaN (item != item is True only for NaN)
-            if item != item:
-                return False  # Found NaN
-             # Check for Inf using local variables
-            if item == pos_inf or item == neg_inf:
-                return False  # Found Inf
-        return True  # No NaN or Inf found
-    except (
-        AttributeError,
-        TypeError,
-        IndexError,
-    ):  # Common errors if input is not a valid Spark Vector
-        return False
-    except Exception:  # Catch-all for other unexpected issues
-        return False
-
-
-def preprocess_data(spark, table_name_arg, timesteps_arg):
-    """
-    Loads, preprocesses, and splits the data.
-    """
-    df = spark.read.option("header", "true").csv(
-        f"./dataset/{table_name_arg}.csv",
-        inferSchema=True,
-    )
-    print(f"Initial DataFrame row count: {df.count()}")
-    print(f"Initial failure count in df: {df.where(col('failure') == 1).count()}")
-
-    # Drop columns that are entirely NULL
-    cols_to_drop = []
-    for c_name in df.columns:
-        non_null_count = df.where(col(c_name).isNotNull()).count()
-        if non_null_count == 0:
-            cols_to_drop.append(c_name)
-            print(f"Column '{c_name}' contains only NULL values and will be dropped.")
-
-    if cols_to_drop:
-        df = df.drop(*cols_to_drop)
-        print(f"Dropped columns with all NULLs: {cols_to_drop}")
-        print(
-            f"Failure count after dropping all-NULL columns: {df.where(col('failure') == 1).count()}"
-        )
-
-    original_full_pdf_local = df.toPandas()
-
-    categorical_cols, numerical_cols = infer_column_types_from_schema(df.schema)
-    print(f"Original categorical columns: {categorical_cols}")
-    print(f"Original numerical columns: {numerical_cols}")
-
-    if "failure" in numerical_cols:
-        numerical_cols.remove("failure")
-        print(
-            f"'failure' column removed from numerical_cols. New numerical_cols: {numerical_cols}"
-        )
-
-    indexers = [
-        StringIndexer(inputCol=c, outputCol=c + "_idx", handleInvalid="keep")
-        for c in categorical_cols
+    # Columns to select as per user request
+    columns_to_select_initial = [
+        "date",
+        "serial_number",
+        "model",
+        "capacity_bytes",
+        "failure",
+        "datacenter",
+        "cluster_id",
+        "vault_id",
+        "pod_id",
+        "pod_slot_num",
+        "is_legacy_format",
+        "smart_1_normalized",
+        "smart_1_raw",
+        "smart_2_normalized",
+        "smart_2_raw",
+        "smart_3_normalized",
+        "smart_3_raw",
+        "smart_4_normalized",
+        "smart_4_raw",
+        "smart_5_normalized",
+        "smart_5_raw",
+        "smart_7_normalized",
+        "smart_7_raw",
+        "smart_8_normalized",
+        "smart_8_raw",
+        "smart_9_normalized",
+        "smart_9_raw",
+        "smart_10_normalized",
+        "smart_10_raw",
+        "smart_11_normalized",
+        "smart_11_raw",
+        "smart_12_normalized",
+        "smart_12_raw",
+        "smart_13_normalized",
+        "smart_13_raw",
+        "smart_15_normalized",
+        "smart_15_raw",
+        "smart_16_normalized",
+        "smart_16_raw",
+        "smart_17_normalized",
+        "smart_17_raw",
+        "smart_18_normalized",
+        "smart_18_raw",
     ]
-    feature_cols = [c + "_idx" for c in categorical_cols] + numerical_cols
-    print(f"Final feature_cols for VectorAssembler: {feature_cols}")
+    # Load training data
+    train_df = (
+        spark.read.option("header", "true")
+        .csv(f"./dataset/{train_table_name_arg}.csv", inferSchema=True)
+        .select(*columns_to_select_initial)
+        .limit(300000)
+    )
 
-    if not feature_cols:
-        print(
-            "Error: feature_cols is empty. No features to assemble and scale. Exiting."
+    # Load test data
+    test_df = (
+        spark.read.option("header", "true")
+        .csv(
+            f"./dataset/{test_table_name_arg}.csv",
+            inferSchema=True,
         )
-        sys.exit(1)
+        .select(*columns_to_select_initial)
+    )
 
-    problematic_numerical_cols = []
-    if numerical_cols:
-        df_schema = df.schema
-        print(f"df_schema: {df_schema}")
-        for nc in numerical_cols:
-            field = df_schema[nc]
-            data_type = field.dataType
-            null_count_stats = df.select(
-                count(when(col(nc).isNull(), nc)).alias("null_count")
-            ).first()
-            current_total_rows = df.count()
-            is_all_null = null_count_stats["null_count"] == current_total_rows
+    # --- Define Spark ML Preprocessing Pipeline based on training data ---
+    all_numeric_cols = [
+        f.name
+        for f in train_df.schema.fields
+        if isinstance(f.dataType, NumericType) and f.name.lower() != "failure"
+    ]
 
-            if is_all_null:
-                print(f"Warning: Column '{nc}' (type: {data_type}) is ALL NULL.")
-                problematic_numerical_cols.append(nc)
-            elif isinstance(data_type, NumericType):
-                stddev_stats = df.select(stddev_pop(nc).alias("stddev")).first()
-                current_stddev = stddev_stats["stddev"]
-                has_zero_stddev = current_stddev is not None and current_stddev == 0.0
-                is_stddev_null = current_stddev is None
-
-                if has_zero_stddev:
-                    print(
-                        f"Warning: Numerical column '{nc}' has zero standard deviation (all values are the same)."
-                    )
-                    problematic_numerical_cols.append(nc)
-                elif is_stddev_null:
-                    distinct_count = df.select(nc).distinct().count()
-                    if distinct_count == 1:
-                        print(
-                            f"Warning: Numerical column '{nc}' has only one distinct value (implies zero standard deviation)."
-                        )
-                        problematic_numerical_cols.append(nc)
-                    else:
-                        print(
-                            f"Warning: Numerical column '{nc}' has NULL standard deviation but is not all null and has {distinct_count} distinct values. Check data."
-                        )
-                        problematic_numerical_cols.append(nc)
-            elif isinstance(data_type, BooleanType):
-                distinct_non_null_count = df.select(nc).na.drop().distinct().count()
-                if distinct_non_null_count <= 1:
-                    print(
-                        f"Warning: Boolean column '{nc}' has only one distinct non-null value or is all null (implies zero variance for scaling)."
-                    )
-                    problematic_numerical_cols.append(nc)
-
-    if problematic_numerical_cols:
-        print(
-            f"\nFound problematic numerical/boolean columns: {problematic_numerical_cols}"
+    # Filter out numeric columns that are entirely null or NaN
+    valid_numeric_cols = []
+    print("Validating numeric columns for Imputer...")
+    for col_name in all_numeric_cols:
+        non_null_count = (
+            train_df.select(col_name)
+            .filter(col(col_name).isNotNull() & ~isnan(col(col_name)))
+            .count()
         )
-        print(f"Removing them: {problematic_numerical_cols}")
-        numerical_cols = [
-            c for c in numerical_cols if c not in problematic_numerical_cols
-        ]
-        feature_cols = [c + "_idx" for c in categorical_cols] + numerical_cols
-        print(
-            f"Adjusted feature_cols after removing problematic columns: {feature_cols}"
-        )
-        if not feature_cols:
+        if non_null_count > 0:
+            valid_numeric_cols.append(col_name)
+        else:
             print(
-                "Error: feature_cols became empty after removing problematic columns. Exiting."
+                f"Column '{col_name}' is entirely null or NaN and will be excluded from imputation and features."
             )
-            sys.exit(1)
 
-    imputer_stages = []
-    imputed_numerical_cols_final = numerical_cols
-    if numerical_cols:
-        print(f"Starting imputation for numerical columns: {numerical_cols}")
-        imputer = Imputer(
-            inputCols=numerical_cols,
-            outputCols=[c + "_imputed" for c in numerical_cols],
-            strategy="median",
-        )
-        imputer_stages.append(imputer)
-        imputed_numerical_cols_final = [c + "_imputed" for c in numerical_cols]
+    if not valid_numeric_cols:
         print(
-            f"Numerical columns after imputation will be: {imputed_numerical_cols_final}"
+            "Error: No valid numeric columns found for the pipeline. Please check your CSV or customize column selection."
         )
+        return None
 
-    feature_cols_for_assembler = [
-        c + "_idx" for c in categorical_cols
-    ] + imputed_numerical_cols_final
+    print(f"Using valid numeric columns for pipeline: {valid_numeric_cols}")
 
-    validate_features_udf = udf(_validate_spark_vector_features, BooleanType())
+    stages = []
 
+    # Stage 1: Imputer for missing values
+    imputed_numeric_cols = [col_name + "_imputed" for col_name in valid_numeric_cols]
+    imputer = Imputer(
+        inputCols=valid_numeric_cols,
+        outputCols=imputed_numeric_cols,
+        strategy="median",
+    )
+    stages.append(imputer)
+
+    # Stage 2: VectorAssembler
     assembler = VectorAssembler(
-        inputCols=feature_cols_for_assembler,
-        outputCol="assembled_features",
-        handleInvalid="keep",
+        inputCols=imputed_numeric_cols,
+        outputCol="features_unscaled",
+        handleInvalid="skip",
     )
+    stages.append(assembler)
+
+    # Stage 3: StandardScaler
     scaler = StandardScaler(
-        inputCol="assembled_features", outputCol="features", withMean=True, withStd=True
+        inputCol="features_unscaled", outputCol="features", withStd=True, withMean=True
     )
-    pipeline_stages = indexers + imputer_stages + [assembler, scaler]
-    pipeline = Pipeline(stages=pipeline_stages)
-    fitted_pipeline = pipeline.fit(df)
+    stages.append(scaler)
 
-    # Save the pipeline
-    pipeline_dir = "./pipelines/LSTM_AE_pipeline"
-    os.makedirs(pipeline_dir, exist_ok=True)
-    pipeline_path = os.path.join(pipeline_dir, f"pipeline_{table_name_arg}")
-    fitted_pipeline.write().overwrite().save(pipeline_path)
-    print(f"Saved pipeline to: {pipeline_path}")
+    pipeline = Pipeline(stages=stages)
 
-    processed_df_features = fitted_pipeline.transform(df)
-    print(
-        f"Failure count after Spark ML pipeline (before UDF filter): {processed_df_features.where(col('failure') == 1).count()}"
+    # Fit pipeline on training data
+    print("Fitting preprocessing pipeline on training data...")
+    pipeline_model = pipeline.fit(train_df)
+    print("Preprocessing pipeline fitted.")
+
+    # Save pipeline artifacts
+    pipeline_save_path = (
+        f"./pipelines/LSTM_AE_pipeline/LSTM_AE_pipeline_{train_table_name_arg}"
     )
+    pipeline_model.write().overwrite().save(pipeline_save_path)
+    print(f"Full preprocessing pipeline model saved to: {pipeline_save_path}")
 
-    valid_rows = processed_df_features.filter(validate_features_udf(col("features")))
-    print(f"Number of valid rows after processing: {valid_rows.count()}")
-    print(
-        f"Failure count in valid_rows (after UDF filter): {valid_rows.where(col('failure') == 1).count()}"
+    # Transform both training and test data
+    print("Transforming training data...")
+    processed_train_df = pipeline_model.transform(train_df)
+    print("Transforming test data...")
+    processed_test_df = pipeline_model.transform(test_df)
+
+    # Convert to pandas and prepare sequences
+    columns_to_select = ["features"]
+    if "failure" in processed_train_df.columns:
+        columns_to_select.append("failure")
+
+    # Process training data
+    train_pdf = processed_train_df.select(columns_to_select).toPandas()
+    train_feature_list = (
+        train_pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
     )
-    print(
-        f"Number of invalid rows: {processed_df_features.count() - valid_rows.count()}"
+    train_data = np.array(train_feature_list, dtype=np.float32)
+    X_train_sequences = create_sequences(train_data, timesteps_arg)
+
+    # Process test data
+    test_pdf = processed_test_df.select(columns_to_select).toPandas()
+    test_feature_list = (
+        test_pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
     )
+    test_data = np.array(test_feature_list, dtype=np.float32)
+    X_test_sequences = create_sequences(test_data, timesteps_arg)
 
-    if valid_rows.count() == 0:
-        print("Error: No valid rows after processing. Check data preprocessing steps.")
-        sys.exit(1)
-
-    processed_pdf = valid_rows.select("features", "failure").toPandas()
-    print(
-        f"Failure count in processed_pdf (Pandas): {processed_pdf[processed_pdf['failure'] == 1].shape[0]}"
-    )
-    normal_pdf = processed_pdf[processed_pdf["failure"] == 0].copy()
-    failure_pdf = processed_pdf[processed_pdf["failure"] == 1].copy()
-    print(f"Number of failure records in failure_pdf (Pandas): {failure_pdf.shape[0]}")
-    failure_pdf_original_indices_local = failure_pdf.index.tolist()
-
-    normal_feature_list = (
-        normal_pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
-    )
-    normal_data = np.array(normal_feature_list, dtype=np.float32)
-    failure_feature_list = (
-        failure_pdf["features"].apply(lambda x: np.array(x.toArray())).tolist()
-    )
-    failure_data = np.array(failure_feature_list, dtype=np.float32)
-    print(
-        f"Shape of failure_data (NumPy before create_sequences): {failure_data.shape}"
-    )
-
-    # Create sequences for normal data
-    X_normal_sequences = create_sequences(normal_data, timesteps_arg)
-
-    # Create sequences for failure data that preserve all failure records
-    if len(failure_data) > 0:
-        # Create a sliding window of sequences, but ensure each failure record is in at least one sequence
-        X_failure_sequences = []
-        failure_indices = []
-
-        # For each failure record, create a sequence centered around it
-        for i in range(len(failure_data)):
-            # Calculate start and end indices for the sequence
-            start_idx = max(0, i - timesteps_arg // 2)
-            end_idx = min(len(failure_data), i + timesteps_arg // 2)
-
-            # If we don't have enough records before or after, adjust the sequence
-            if end_idx - start_idx < timesteps_arg:
-                if start_idx == 0:
-                    end_idx = min(len(failure_data), timesteps_arg)
-                else:
-                    start_idx = max(0, end_idx - timesteps_arg)
-
-            # Create the sequence
-            sequence = failure_data[start_idx:end_idx]
-
-            # If sequence is shorter than timesteps_arg, pad with normal data
-            if len(sequence) < timesteps_arg:
-                padding_needed = timesteps_arg - len(sequence)
-                if start_idx == 0:  # Pad at the beginning
-                    padding_data = normal_data[:padding_needed]
-                    sequence = np.vstack([padding_data, sequence])
-                else:  # Pad at the end
-                    padding_data = normal_data[:padding_needed]
-                    sequence = np.vstack([sequence, padding_data])
-
-            X_failure_sequences.append(sequence)
-            failure_indices.append(i)
-
-        X_failure_sequences = np.array(X_failure_sequences)
-    else:
-        X_failure_sequences = np.empty((0, timesteps_arg, normal_data.shape[1]))
-        failure_indices = []
-
-    print(
-        f"Shape of X_failure_sequences (NumPy after create_sequences): {X_failure_sequences.shape}"
-    )
-
-    if X_normal_sequences.ndim > 1 and X_normal_sequences.shape[0] > 0:
-        train_size_normal = int(0.8 * len(X_normal_sequences))
-        X_train_local = X_normal_sequences[:train_size_normal]
-        X_test_normal_local = X_normal_sequences[train_size_normal:]
-        y_test_normal_labels_local = np.zeros(len(X_test_normal_local))
-    else:
-        X_train_local = np.empty(
-            (
-                0,
-                timesteps_arg,
-                (
-                    normal_data.shape[1]
-                    if normal_data.ndim > 1 and normal_data.shape[1] > 0
-                    else 0
-                ),
-            )
-        )
-        X_test_normal_local = np.empty(
-            (
-                0,
-                timesteps_arg,
-                (
-                    normal_data.shape[1]
-                    if normal_data.ndim > 1 and normal_data.shape[1] > 0
-                    else 0
-                ),
-            )
-        )
-        y_test_normal_labels_local = np.array([])
-
-    X_test_failure_local = X_failure_sequences
-    y_test_failure_labels_local = np.ones(len(X_test_failure_local))
-
-    print(f"X_train shape: {X_train_local.shape}")
-    print(f"X_test_normal shape: {X_test_normal_local.shape}")
-    print(f"X_test_failure shape: {X_test_failure_local.shape}")
+    # Prepare labels if failure column exists
+    y_train = None
+    y_test = None
+    if "failure" in train_pdf.columns:
+        y_train = train_pdf["failure"].values
+        y_test = test_pdf["failure"].values
 
     return (
-        original_full_pdf_local,
-        X_train_local,
-        X_test_normal_local,
-        X_test_failure_local,
-        y_test_normal_labels_local,
-        y_test_failure_labels_local,
-        failure_pdf_original_indices_local,
-        failure_indices,  # Return the failure indices for proper tracking
+        train_df.toPandas(),
+        test_df.toPandas(),
+        X_train_sequences,
+        X_test_sequences,
+        y_train,
+        y_test,
     )
 
 
-def load_or_create_model(
-    model_path_arg, timesteps_arg, n_features_arg, X_train_arg, table_name_arg
-):
+def load_or_create_model(model_path_arg, timesteps_arg, n_features_arg, X_train_arg):
     """
     Loads an existing model or creates, trains, and saves a new one.
     """
-    model_dir = "./ml_models"
+    model_dir = os.path.dirname(model_path_arg)
     os.makedirs(model_dir, exist_ok=True)
-    full_model_path = os.path.join(model_dir, f"LSTM_AE_{table_name_arg}.keras")
 
-    lstm_ae_model = None
-    if os.path.exists(full_model_path):
-        print(f"Loading existing model from {full_model_path}")
-        lstm_ae_model = load_model(full_model_path, compile=False)
-        optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
-        lstm_ae_model.compile(optimizer=optimizer, loss="mae")
+    if os.path.exists(model_path_arg):
+        print(f"Loading existing model from {model_path_arg}")
+        autoencoder_model = load_model(model_path_arg, compile=False)
+        optimizer = Adam(learning_rate=0.0001, clipnorm=1.0)
+        autoencoder_model.compile(optimizer=optimizer, loss="mae")
         print("Model loaded and compiled successfully.")
     else:
         print("Defining and training a new model...")
         input_seq = Input(shape=(timesteps_arg, n_features_arg))
-        encoded = LSTM(32, activation="tanh", return_sequences=True)(input_seq)
-        encoded = LSTM(16, activation="tanh")(encoded)
-        decoded = RepeatVector(timesteps_arg)(encoded)
-        decoded = LSTM(16, activation="tanh", return_sequences=True)(decoded)
-        decoded = LSTM(32, activation="tanh", return_sequences=True)(decoded)
-        decoded = TimeDistributed(Dense(n_features_arg))(decoded)
-        lstm_ae_model = Model(inputs=input_seq, outputs=decoded)
 
-        optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
-        lstm_ae_model.compile(optimizer=optimizer, loss="mae")
-        lstm_ae_model.summary()
+        # Add Gaussian noise to input for better generalization
+        x = tf.keras.layers.GaussianNoise(0.01)(input_seq)
 
-        if np.any(np.isnan(X_train_arg)) or np.any(np.isinf(X_train_arg)):
-            print(
-                "\nERROR: X_train contains NaNs or Infs before model training! Cannot proceed."
-            )
-            sys.exit(1)
+        # Encoder with stacked LSTM layers
+        x = LSTM(
+            128,
+            activation="tanh",
+            return_sequences=True,
+            kernel_regularizer=l2(0.0001),
+            recurrent_regularizer=l2(0.0001),
+            recurrent_dropout=0.1,
+        )(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.1)(x)
 
-        print("\nNo NaNs or Infs found in X_train. Proceeding with training.")
-        print(
-            f"Input to lstm_ae.fit - X_train shape: {X_train_arg.shape}, y_train shape: {X_train_arg.shape}"
-        )
+        x = LSTM(
+            64,
+            activation="tanh",
+            return_sequences=True,
+            kernel_regularizer=l2(0.0001),
+            recurrent_regularizer=l2(0.0001),
+            recurrent_dropout=0.1,
+        )(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.1)(x)
 
+        # Latent space (bottleneck)
+        encoded = LSTM(
+            32,
+            activation="tanh",
+            return_sequences=False,
+            kernel_regularizer=l2(0.0001),
+            recurrent_regularizer=l2(0.0001),
+            recurrent_dropout=0.1,
+        )(x)
+        encoded = BatchNormalization()(encoded)
+        encoded = Dropout(0.2)(encoded)
+
+        x = RepeatVector(timesteps_arg)(encoded)
+
+        x = LSTM(
+            64,
+            activation="tanh",
+            return_sequences=True,
+            kernel_regularizer=l2(0.0001),
+            recurrent_regularizer=l2(0.0001),
+            recurrent_dropout=0.1,
+        )(x)
+        x = BatchNormalization()(x)
+
+        x = LSTM(
+            128,
+            activation="tanh",
+            return_sequences=True,
+            kernel_regularizer=l2(0.0001),
+            recurrent_regularizer=l2(0.0001),
+        )(x)
+        x = BatchNormalization()(x)
+
+        # Output layer with L2 regularization
+        decoded = TimeDistributed(
+            Dense(n_features_arg, activation="linear", kernel_regularizer=l2(0.0001))
+        )(x)
+
+        autoencoder_model = Model(inputs=input_seq, outputs=decoded)
+
+        optimizer = Adam(learning_rate=0.001, clipnorm=1.0)
+        autoencoder_model.compile(optimizer=optimizer, loss="mae")
+        autoencoder_model.summary()
+
+        # Enhanced training configuration
         early_stopping = tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=3, restore_best_weights=True
+            monitor="val_loss",
+            patience=20,
+            restore_best_weights=True,
+            min_delta=0.0001,
         )
-        history = lstm_ae_model.fit(
+
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.2,
+            patience=10,
+            min_lr=0.000001,
+            verbose=1,
+        )
+
+        # Train the model with optimized batch size
+        history = autoencoder_model.fit(
             X_train_arg,
             X_train_arg,
-            epochs=10,
-            batch_size=32,
+            epochs=100,
+            batch_size=256,
             validation_split=0.2,
             shuffle=True,
-            callbacks=[early_stopping],
+            callbacks=[early_stopping, reduce_lr],
         )
-        # Save the trained model
-        lstm_ae_model.save(full_model_path)
-        print(f"New model saved to {full_model_path}")
-    return lstm_ae_model
+
+        # Save the model after training
+        try:
+            autoencoder_model.save(model_path_arg, save_format="keras")
+            print(f"New model saved to {model_path_arg}")
+        except Exception as e:
+            print(f"Warning: Could not save model in keras format: {e}")
+            try:
+                autoencoder_model.save(model_path_arg, save_format="tf")
+                print(f"New model saved to {model_path_arg} in TensorFlow format")
+            except Exception as e:
+                print(f"Error saving model: {e}")
+                print("Continuing with the trained model in memory...")
+
+    return autoencoder_model
 
 
-def predict_and_evaluate(model, X_test_normal_arg, X_test_failure_arg):
+def predict_and_evaluate(
+    model, X_test_normal_arg, X_test_failure_arg, batch_size_arg=64
+):
     """
-    Predicts and evaluates the model on test data.
+    Predicts and evaluates the model on test data, using batching to conserve memory.
     """
     # Predict on normal test data
-    reconstructed_normal = model.predict(X_test_normal_arg)
+    print(f"Predicting on normal test data with batch size {batch_size_arg}...")
+    reconstructed_normal = model.predict(X_test_normal_arg, batch_size=batch_size_arg)
     reconstruction_errors_normal = mae_error(X_test_normal_arg, reconstructed_normal)
 
     # Predict on failure test data
-    reconstructed_failure = model.predict(X_test_failure_arg)
+    print(f"Predicting on failure test data with batch size {batch_size_arg}...")
+    reconstructed_failure = model.predict(X_test_failure_arg, batch_size=batch_size_arg)
     reconstruction_errors_failure = mae_error(X_test_failure_arg, reconstructed_failure)
 
     return reconstruction_errors_normal, reconstruction_errors_failure
@@ -521,80 +466,163 @@ def generate_anomaly_report(
 
 
 def main():
-    table_name_main = "2024_12_bb_3d"
+    train_table_name = "2024_12_bb_3d"
+    test_table_name = "2024_12_25_test"
     timesteps_main = 20
     connector = SparkToAWS()
     spark_main = connector.create_local_spark_session()
 
     (
-        original_full_pdf_main,
+        original_train_pdf,
+        original_test_pdf,
         X_train_main,
-        X_test_normal_main,
-        X_test_failure_main,
-        y_test_normal_labels_main,
-        y_test_failure_labels_main,
-        failure_pdf_original_indices_main,
-        failure_indices_main,
-    ) = preprocess_data(spark_main, table_name_main, timesteps_main)
-
-    if X_train_main.shape[0] == 0 or X_train_main.shape[2] == 0:
-        print(
-            "Error: X_train is empty or has no features. Cannot proceed with model training/loading."
-        )
-        sys.exit(1)
+        X_test_main,
+        y_train_main,
+        y_test_main,
+    ) = preprocess_data(spark_main, train_table_name, test_table_name, timesteps_main)
 
     n_features_main = X_train_main.shape[2]
-    model_path_main = os.path.join("./ml_models", f"LSTM_AE_{table_name_main}.keras")
+    model_path_main = os.path.join("./ml_models", f"LSTM_AE_{train_table_name}.keras")
 
     # Check if model was loaded or newly trained
     model_was_loaded = os.path.exists(model_path_main)
-    lstm_ae_main = load_or_create_model(
-        model_path_main, timesteps_main, n_features_main, X_train_main, table_name_main
+    autoencoder_main = load_or_create_model(
+        model_path_main, timesteps_main, n_features_main, X_train_main
     )
 
-    (
-        reconstruction_errors_normal_main,
-        reconstruction_errors_failure_main,
-    ) = predict_and_evaluate(lstm_ae_main, X_test_normal_main, X_test_failure_main)
-
-    all_reconstruction_errors_main = np.concatenate(
-        [reconstruction_errors_normal_main, reconstruction_errors_failure_main]
-    )
-    all_true_labels_main = np.concatenate(
-        [y_test_normal_labels_main, y_test_failure_labels_main]
+    thresholds_dir = "./dataset/thresholds"
+    threshold_file = os.path.join(
+        thresholds_dir, f"LSTM_AE_threshold_{train_table_name}.txt"
     )
 
-    threshold_main = 1.0
-    if len(reconstruction_errors_normal_main) > 0:
-        threshold_main = np.percentile(reconstruction_errors_normal_main, 95)
-        print(
-            f"\nAnomaly Threshold (95th percentile of normal data): {threshold_main:.4f}"
+    if model_was_loaded and os.path.exists(threshold_file):
+        print(f"Loading existing threshold from {threshold_file}")
+        with open(threshold_file, "r") as f:
+            threshold_main = float(f.read())
+        print(f"Threshold loaded: {threshold_main:.4f}")
+
+        del X_train_main
+        gc.collect()
+        print("Training data cleared.")
+
+    else:
+        # Calculate threshold on training data reconstruction errors for a more robust baseline
+        print("Calculating threshold from training data reconstruction errors...")
+        reconstructed_train = autoencoder_main.predict(X_train_main, batch_size=64)
+        reconstruction_errors_train = mae_error(X_train_main, reconstructed_train)
+
+        # Calculate dynamic threshold using IQR method
+        Q1 = np.percentile(reconstruction_errors_train, 25)
+        Q3 = np.percentile(reconstruction_errors_train, 75)
+        IQR = Q3 - Q1
+        threshold_main = Q3 + (1.5 * IQR)  # Standard outlier detection threshold
+
+        print(f"\nAnomaly Threshold (Q3 + 1.5*IQR): {threshold_main:.4f}")
+        print(f"Q1: {Q1:.4f}, Q3: {Q3:.4f}, IQR: {IQR:.4f}")
+
+        # Save threshold
+        os.makedirs(thresholds_dir, exist_ok=True)
+        with open(threshold_file, "w") as f:
+            f.write(f"{threshold_main}")
+        print(f"Threshold saved to: {threshold_file}")
+
+        del X_train_main, reconstructed_train, reconstruction_errors_train
+        gc.collect()
+        print("Training data cleared.")
+
+    # Predict on test data
+    print("Predicting on test data...")
+    reconstructed_test = autoencoder_main.predict(X_test_main, batch_size=64)
+    reconstruction_errors = mae_error(X_test_main, reconstructed_test)
+
+    # --- Reconstruction Error Statistics for Test Dataset ---
+    print("\n--- Reconstruction Error Statistics for Test Dataset ---")
+    print(f"Min Error: {np.min(reconstruction_errors):.4f}")
+    print(f"Max Error: {np.max(reconstruction_errors):.4f}")
+    print(f"Mean Error: {np.mean(reconstruction_errors):.4f}")
+    print(f"Median Error: {np.median(reconstruction_errors):.4f}")
+    print(f"Std Dev of Error: {np.std(reconstruction_errors):.4f}")
+    print("--------------------------------------------------\n")
+
+    # For plotting and evaluation, we need to align errors with original data
+    padding_size = len(original_test_pdf) - len(reconstruction_errors)
+
+    # Check if true labels are available for rich plotting
+    true_labels_for_plot = None
+    if y_test_main is not None:
+        true_labels_for_plot = y_test_main[padding_size:]
+
+    # Plot reconstruction error
+    plot_reconstruction_error(
+        reconstruction_errors,
+        threshold_main,
+        test_table_name,
+        true_labels=true_labels_for_plot,
+    )
+
+    # Generate anomaly predictions
+    anomaly_predictions = reconstruction_errors > threshold_main
+
+    # Save anomalies
+    output_dir = "./dataset/anomalies"
+    os.makedirs(output_dir, exist_ok=True)
+    anomalies_path = os.path.join(
+        output_dir, f"LSTM_AE_anomalies_{test_table_name}.csv"
+    )
+
+    # Create results DataFrame to work with
+    results_df = original_test_pdf.copy()
+
+    results_df["reconstruction_error"] = np.pad(
+        reconstruction_errors, (padding_size, 0), constant_values=np.nan
+    )
+    results_df["is_anomaly"] = np.pad(
+        anomaly_predictions, (padding_size, 0), constant_values=False
+    )
+    if y_test_main is not None:
+        results_df["actual_failure"] = y_test_main
+
+    # Filter for anomalies and save them
+    anomalies_df = results_df[results_df["is_anomaly"] == True].copy()
+    anomalies_df.to_csv(anomalies_path, index=False)
+    print(f"Found {len(anomalies_df)} anomalies. Saved to: {anomalies_path}")
+
+    if y_test_main is not None:
+        # --- Performance Statistics ---
+        # We only consider records for which a prediction was possible (i.e., after the initial sequence window)
+        eval_df = results_df.iloc[padding_size:].copy()
+        eval_df["actual_failure"] = eval_df["actual_failure"].astype(bool)
+        eval_df["is_anomaly"] = eval_df["is_anomaly"].astype(bool)
+
+        true_positives = len(
+            eval_df[
+                (eval_df["is_anomaly"] == True) & (eval_df["actual_failure"] == True)
+            ]
+        )
+        false_positives = len(
+            eval_df[
+                (eval_df["is_anomaly"] == True) & (eval_df["actual_failure"] == False)
+            ]
         )
 
-        # write threshold if model is newly trained
-        if not model_was_loaded:
-            thresholds_dir = "./dataset/thresholds"
-            os.makedirs(thresholds_dir, exist_ok=True)
-            threshold_file = os.path.join(
-                thresholds_dir, f"LSTM_AE_threshold_{table_name_main}.txt"
-            )
-            with open(threshold_file, "w") as f:
-                f.write(f"{threshold_main:.4f}")
-            print(f"Threshold saved to: {threshold_file}")
+        total_actual_failures = eval_df["actual_failure"].sum()
+        detection_rate = (
+            (true_positives / total_actual_failures) * 100
+            if total_actual_failures > 0
+            else 0
+        )
 
-    generate_anomaly_report(
-        reconstruction_errors_normal_main,
-        reconstruction_errors_failure_main,
-        threshold_main,
-        original_full_pdf_main,
-        failure_pdf_original_indices_main,
-        timesteps_main,
-        table_name_main,
-    )
+        print("\n--- Model Performance Statistics ---")
+        print(f"True Positives: {true_positives}")
+        print(f"False Positives: {false_positives}")
+        print(f"Total actual failures in evaluated data: {total_actual_failures}")
+        print(f"Detection Rate: {detection_rate:.2f}%")
+        print("------------------------------------\n")
 
-    plot_roc_curve(
-        all_true_labels_main, all_reconstruction_errors_main, table_name_main
-    )
+        plot_roc_curve(
+            y_test_main[padding_size:], reconstruction_errors, test_table_name
+        )
+
     connector.close_spark_session()
     print("Script finished.")
 

@@ -65,16 +65,17 @@ class SparkToAWS:
         return self.spark
 
     def create_local_spark_session(self):
-        local_spark = (
+        self.spark = (
             SparkSession.builder.appName("AE")
             .master("local[*]")
             .config("spark.executor.memory", "4g")
             .config("spark.driver.memory", "4g")
             .getOrCreate()
         )
-        return local_spark
+        return self.spark
 
     def close_spark_session(self):
         if self.spark:
             self.spark.stop()
             self.spark = None
+        return
