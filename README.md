@@ -35,6 +35,18 @@ Models have been tested using data of 2024-12-25.
 - **False Positive Rate**: 53% (1 false positives)
 - LSTM layers with decreasing dimensions (128 → 64 → 32 → 64 → 128)
 
+#### LSTM VAE Performance
+- Training completed in 100 epochs
+- **Total normal records processed**: 219784
+- **Total failure records processed**: 4
+- **True Positives**: 3
+- **False Positives**: 54691
+- **Detection Rate**: 75.00%
+- **False Positive Rate**: 24.89%
+- LSTM layers with decreasing dimensions (128 → 64 → 32 → 64 → 128)
+- VAE latent space dimension: 16
+- Threshold set at 95th percentile of reconstruction errors
+
 #### Autoencoder Performance
 - Training completed in ~50 epochs
 - **Total normal records processed**: 219784

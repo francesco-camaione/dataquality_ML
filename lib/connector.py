@@ -68,6 +68,8 @@ class SparkToAWS:
         self.spark = (
             SparkSession.builder.appName("AE")
             .master("local[*]")
+            .config("spark.driver.host", "localhost")
+            .config("spark.driver.bindAddress", "localhost")
             .config("spark.executor.memory", "4g")
             .config("spark.driver.memory", "4g")
             .getOrCreate()

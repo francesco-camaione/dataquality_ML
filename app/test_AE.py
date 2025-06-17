@@ -7,14 +7,13 @@ sys.path.append(project_root)
 import tensorflow as tf
 import numpy as np
 import pandas as pd
-from pyspark.sql import SparkSession, types
-from pyspark.sql.functions import col, isnan, lit
+from pyspark.sql import types
+from pyspark.sql.functions import col, lit
 from keras.models import load_model
 from pyspark.sql.functions import col
 from lib.connector import SparkToAWS
 from lib.utils import (
     mae_error_ae,
-    infer_column_types_from_schema,
     plot_roc_curve,
     boolean_columns,
     build_and_fit_feature_pipeline,

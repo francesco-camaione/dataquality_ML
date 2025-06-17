@@ -8,14 +8,11 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
 
 from pyspark.sql import functions, types
-from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
 import keras
 import numpy as np
 from lib.connector import SparkToAWS
 from lib.utils import (
     mae_error_ae,
-    infer_column_types_from_schema,
     boolean_columns,
     build_and_fit_feature_pipeline,
 )
@@ -301,9 +298,7 @@ if total_fraud_records > 0 and detected > 0:
             df_fraud_for_pandas = df_fraud_for_pandas.withColumn(
                 col_name, functions.col(col_name).cast("string")
             )
-    raw_fraud_pdf = df_fraud_for_pandas.toPandas().iloc[
-        anomaly_idxs
-    ]  # Filter pandas df
+    raw_fraud_pdf = df_fraud_for_pandas.toPandas().iloc[anomaly_idxs]
     # Add normalized reconstruction error to the anomaly table
     # Ensure mae_test_fraud[anomaly_idxs] aligns with raw_fraud_pdf
     raw_fraud_pdf["reconstruction_error"] = mae_test_fraud[anomaly_idxs]
@@ -345,4 +340,4 @@ if mae_train_normal.size > 0 and mae_test_fraud.size > 0:
     plt.savefig(f"./plots/ROC_Curve_AE_{table_name}.png")
     print(f"ROC curve plot saved to: ./plots/ROC_Curve_AE_{table_name}.png")
 
-connector.close_spark_session()  # Changed from connector.close_spark_session()
+connector.close_spark_session()
