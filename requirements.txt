@@ -8,4 +8,7 @@ numpy==1.23.5
 pandas==1.5.3
 boto3>=1.26.0
 matplotlib==3.10.1
-tensorflowonspark==1.4.4 
+tensorflowonspark==1.4.4
+keras
+imbalanced-learn
+joblib 
