@@ -1,7 +1,6 @@
 import sys
 import os
 import tensorflow as tf
-import json
 import gc
 
 tf.config.set_visible_devices([], "GPU")
@@ -10,19 +9,23 @@ sys.path.append(project_root)
 
 import numpy as np
 import pandas as pd
+
+# Fix for PySpark compatibility with newer NumPy versions
+# This addresses the np.bool deprecation issue
+if not hasattr(np, "bool"):
+    np.bool = np.bool_
+
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler, StandardScaler, Imputer
 from keras.models import Model, load_model
 from keras.layers import (
     Input,
     LSTM,
-    GRU,
     RepeatVector,
     TimeDistributed,
     Dense,
     Dropout,
     BatchNormalization,
-    Bidirectional,
     Lambda,
 )
 from keras.optimizers.legacy import Adam
@@ -440,6 +443,51 @@ def predict_and_evaluate(
     return reconstruction_errors_normal, reconstruction_errors_failure
 
 
+def plot_roc_curve_lstm_vae(
+    all_true_labels_arg, all_reconstruction_errors_arg, table_name_arg
+):
+    """
+    Generates and saves the ROC curve plot specifically for LSTM-VAE model.
+    """
+    from sklearn.metrics import roc_curve, auc
+    import matplotlib.pyplot as plt
+
+    if len(all_true_labels_arg) > 0 and len(np.unique(all_true_labels_arg)) > 1:
+        fpr, tpr, _ = roc_curve(all_true_labels_arg, all_reconstruction_errors_arg)
+        roc_auc = auc(fpr, tpr)
+        plots_dir = "./plots"
+        os.makedirs(plots_dir, exist_ok=True)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            fpr,
+            tpr,
+            color="darkorange",
+            lw=2,
+            label=f"ROC curve (area = {roc_auc:.4f})",
+        )
+        plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"LSTM-VAE ROC Curve - {table_name_arg}")
+        plt.legend(loc="lower right")
+        plt.grid(True)
+
+        roc_plot_path = os.path.join(
+            plots_dir, f"ROC_Curve_LSTM_VAE_{table_name_arg}.png"
+        )
+        plt.savefig(roc_plot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"LSTM-VAE ROC curve saved to {roc_plot_path}")
+    else:
+        print(
+            "Warning: Cannot generate ROC curve - insufficient true labels or no variation in labels."
+        )
+    return
+
+
 def generate_anomaly_report(
     reconstruction_errors_normal_arg,
     reconstruction_errors_failure_arg,
@@ -685,9 +733,71 @@ def main():
         print(f"Detection Rate: {detection_rate:.2f}%")
         print("------------------------------------\n")
 
-        plot_roc_curve(
+        # Plot ROC curve with true labels
+        plot_roc_curve_lstm_vae(
             y_test_main[padding_size:], reconstruction_errors, test_table_name
         )
+    else:
+        # If no true labels available, still save a basic ROC curve plot
+        # using reconstruction errors as scores (assuming higher errors are more anomalous)
+        print("No true labels available for ROC curve calculation.")
+        print("Saving reconstruction error distribution plot instead.")
+
+        # Create a simple plot showing the distribution of reconstruction errors
+        import matplotlib.pyplot as plt
+
+        plots_dir = "./plots"
+        os.makedirs(plots_dir, exist_ok=True)
+
+        plt.figure(figsize=(12, 8))
+
+        # Plot 1: Reconstruction error distribution
+        plt.subplot(2, 1, 1)
+        plt.hist(
+            reconstruction_errors,
+            bins=50,
+            alpha=0.7,
+            color="skyblue",
+            edgecolor="black",
+        )
+        plt.axvline(
+            x=threshold_main,
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            label=f"Threshold: {threshold_main:.4f}",
+        )
+        plt.xlabel("Reconstruction Error")
+        plt.ylabel("Frequency")
+        plt.title(f"LSTM-VAE Reconstruction Error Distribution - {test_table_name}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Plot 2: Reconstruction errors over time
+        plt.subplot(2, 1, 2)
+        plt.plot(reconstruction_errors, alpha=0.7, color="blue", linewidth=0.5)
+        plt.axhline(
+            y=threshold_main,
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            label=f"Threshold: {threshold_main:.4f}",
+        )
+        plt.xlabel("Sequence Index")
+        plt.ylabel("Reconstruction Error")
+        plt.title(f"LSTM-VAE Reconstruction Errors Over Time - {test_table_name}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Save the plot
+        plot_path = os.path.join(
+            plots_dir, f"LSTM_VAE_Reconstruction_Analysis_{test_table_name}.png"
+        )
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"Reconstruction error analysis plot saved to {plot_path}")
 
     connector.close_spark_session()
     print("Script finished.")

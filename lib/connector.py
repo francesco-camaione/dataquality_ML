@@ -2,7 +2,6 @@ from pyspark.sql import SparkSession
 import os
 
 
-# AWS Configuration
 AWS_REGION = "eu-west-1"
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")

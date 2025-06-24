@@ -2,7 +2,7 @@ import sys
 import os
 
 from matplotlib import pyplot as plt
-from sklearn.metrics import auc, confusion_matrix, roc_curve
+from sklearn.metrics import auc, roc_curve
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -22,7 +22,6 @@ table_name = "2024_12_bb_3d"
 connector = SparkToAWS()
 spark = connector.create_local_spark_session()
 
-# Load and split dataset
 raw_df = (
     spark.read.option("header", "true").csv(
         f"./dataset/{table_name}.csv", inferSchema=True
@@ -31,9 +30,8 @@ raw_df = (
 
 print("df has ", raw_df.count(), " records")
 
-# Identify boolean columns from the raw schema
 raw_boolean_cols = boolean_columns(raw_df.schema)
-# Cast boolean columns to integer in the raw_df
+
 if raw_boolean_cols:
     print(f"Casting boolean columns to integer: {raw_boolean_cols}")
     for column in raw_boolean_cols:
@@ -41,7 +39,6 @@ if raw_boolean_cols:
             column, functions.col(column).cast(types.IntegerType())
         )
 
-# Separate normal vs fraud without caching
 df_norm = raw_df.where(raw_df["failure"] == 0)
 df_fraud = raw_df.where(raw_df["failure"] == 1)
 print("number of failure records in the raw_df: ", df_fraud.count())
@@ -50,7 +47,6 @@ fitted_pipeline, feature_cols_from_util = build_and_fit_feature_pipeline(
     df_norm, raw_boolean_cols
 )
 
-# Save the fitted pipeline (optional, but can be useful)
 pipeline_path = f"./pipelines/AE_pipeline/pipeline_{table_name}"
 try:
     print(f"\nSaving fitted pipeline to {pipeline_path}...")
@@ -61,22 +57,16 @@ except Exception as e:
     print(f"Error saving pipeline: {str(e)}")
 
 
-print("\nTransforming normal data using the common pipeline...")
 proc_norm_df = fitted_pipeline.transform(df_norm)
 
-print("Transforming failure data using the common pipeline...")
 proc_fraud_df = fitted_pipeline.transform(df_fraud)
 
-# Convert to numpy arrays in batches to minimize memory usage
-print("Converting normal data to numpy arrays...")
 norm_vectors = []
 for row in proc_norm_df.select("features").collect():
     norm_vectors.append(row.features.toArray())
 X_train = np.vstack(norm_vectors).astype(np.float32)
 
-print("Converting failure data to numpy arrays...")
 fraud_vectors = []
-# Handle cases where df_fraud might be empty after transformations or initially
 if df_fraud.count() > 0 and proc_fraud_df.count() > 0:
     for row in proc_fraud_df.select("features").collect():
         fraud_vectors.append(row.features.toArray())
@@ -98,11 +88,6 @@ else:
     X_test = np.empty((0, num_features), dtype=np.float32)
 
 
-# Clean up DataFrames
-# df_norm.unpersist() # Consider if caching was applied
-# df_fraud.unpersist()
-# proc_norm_df.unpersist()
-# proc_fraud_df.unpersist()
 raw_df.unpersist()  # Unpersist raw_df as it's no longer needed directly
 
 model_path = f"./ml_models/AE_{table_name}.keras"
@@ -205,12 +190,10 @@ if not model_was_loaded:
         shuffle=True,
     )
 
-    # Calculate reconstruction error distribution separately for different value ranges
     print("\nCalculating reconstruction error distribution...")
     reconstructed_train = autoencoder.predict(X_train, verbose=0)
     mae_train_normal = mae_error_ae(X_train, reconstructed_train)
 
-    # Dynamic threshold based on the distribution of reconstruction errors
     threshold = np.percentile(mae_train_normal, 95)
     print(f"Using 95th percentile for threshold: {threshold:.4f}")
 
@@ -225,14 +208,12 @@ if not model_was_loaded:
     autoencoder.save(f"./ml_models/AE_{table_name}.keras")
     print(f"Keras model saved to {model_path}")
 
-#  Load trained model & predict
 print(f"\nLoading Keras model from {model_path}...")
 autoencoder = keras.models.load_model(model_path, compile=False)
 optimizer = keras.optimizers.legacy.Adam(learning_rate=0.001)
 
 autoencoder.compile(optimizer=optimizer, loss="mae")
 
-print("Predicting on training (normal) data for threshold calculation...")
 if X_train.shape[0] > 0:
     reconstructed_train = autoencoder.predict(X_train, verbose=0)
     mae_train_normal = mae_error_ae(X_train, reconstructed_train)
@@ -299,10 +280,8 @@ if total_fraud_records > 0 and detected > 0:
                 col_name, functions.col(col_name).cast("string")
             )
     raw_fraud_pdf = df_fraud_for_pandas.toPandas().iloc[anomaly_idxs]
-    # Add normalized reconstruction error to the anomaly table
-    # Ensure mae_test_fraud[anomaly_idxs] aligns with raw_fraud_pdf
+ 
     raw_fraud_pdf["reconstruction_error"] = mae_test_fraud[anomaly_idxs]
-    # raw_fraud_pdf["reconstruction_error_normalized_by_threshold"] = mae_test_fraud[anomaly_idxs] / threshold # Optional
 
     print("\nAnomaly table (fraud records flagged by model):")
     print(raw_fraud_pdf.head())
@@ -312,7 +291,6 @@ if total_fraud_records > 0 and detected > 0:
 else:
     print("\nNo fraud anomalies detected or no fraud data to analyze.")
 
-# Model statistics and ROC curve
 if mae_train_normal.size > 0 and mae_test_fraud.size > 0:
     y_true = np.concatenate(
         [np.zeros(len(mae_train_normal)), np.ones(len(mae_test_fraud))]

@@ -1,14 +1,16 @@
 import sys
 import os
 import tensorflow as tf
-import json
 import gc
+import numpy as np
+
+if not hasattr(np, "bool"):
+    np.bool = bool
 
 tf.config.set_visible_devices([], "GPU")
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
 
-import numpy as np
 import pandas as pd
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler, StandardScaler, Imputer
@@ -16,13 +18,11 @@ from keras.models import Model, load_model
 from keras.layers import (
     Input,
     LSTM,
-    GRU,
     RepeatVector,
     TimeDistributed,
     Dense,
     Dropout,
     BatchNormalization,
-    Bidirectional,
 )
 from keras.optimizers.legacy import Adam
 from keras.regularizers import l2
@@ -107,7 +107,6 @@ def preprocess_data(spark, train_table_name_arg, test_table_name_arg, timesteps_
         .select(*columns_to_select_initial)
     )
 
-    # --- Define Spark ML Preprocessing Pipeline based on training data ---
     all_numeric_cols = [
         f.name
         for f in train_df.schema.fields

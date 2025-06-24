@@ -22,7 +22,6 @@ def preprocess_data(spark, train_table_name_arg, test_table_name_arg):
     Loads and preprocesses both training and test data.
     Fits preprocessing pipeline on training data and applies it to both datasets.
     """
-    # Columns to select as per user request
     columns_to_select_initial = [
         "date",
         "serial_number",
@@ -69,28 +68,24 @@ def preprocess_data(spark, train_table_name_arg, test_table_name_arg):
         "smart_18_raw",
     ]
 
-    # Load training data
     train_df = (
         spark.read.option("header", "true")
         .csv(f"./dataset/{train_table_name_arg}.csv", inferSchema=True)
         .select(*columns_to_select_initial)
     )
 
-    # Load test data
     test_df = (
         spark.read.option("header", "true")
         .csv(f"./dataset/{test_table_name_arg}.csv", inferSchema=True)
         .select(*columns_to_select_initial)
     )
 
-    # Define Spark ML Preprocessing Pipeline based on training data
     all_numeric_cols = [
         f.name
         for f in train_df.schema.fields
         if isinstance(f.dataType, NumericType) and f.name.lower() != "failure"
     ]
 
-    # Filter out numeric columns that are entirely null or NaN
     valid_numeric_cols = []
     print("Validating numeric columns for Imputer...")
     for col_name in all_numeric_cols:

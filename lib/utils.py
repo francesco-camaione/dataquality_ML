@@ -56,13 +56,10 @@ def mae_error_ae(test_data, reconstructed_data):
     min_variance = 1e-6
     feature_variances = np.maximum(feature_variances, min_variance)
 
-    # Calculate absolute errors for each feature
     abs_errors = np.abs(test_data - reconstructed_data)
 
-    # Normalize errors by feature variance
     normalized_errors = abs_errors / feature_variances
 
-    # Calculate per-record mean normalized error
     return np.mean(normalized_errors, axis=1)
 
 
